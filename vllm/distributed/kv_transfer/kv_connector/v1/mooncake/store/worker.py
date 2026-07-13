@@ -1454,7 +1454,12 @@ class MooncakeStoreWorker:
 
         return finished_sending
 
-    def lookup(self, token_len: int, block_hashes: Sequence[BlockHash]) -> int:
+    def lookup(
+        self,
+        token_len: int,
+        block_hashes: Sequence[BlockHash],
+        known_local_hit_tokens: int = 0,
+    ) -> int:
         """Check how many prefix tokens exist in the store.
 
         Checks across all rank-specific key namespaces that may be loaded.
@@ -1462,10 +1467,13 @@ class MooncakeStoreWorker:
         if not block_hashes or token_len <= 0:
             return 0
 
+        known_local_hit_tokens = max(0, min(known_local_hit_tokens, token_len))
+
         # Build per-(group, hash) candidate keys expanded across rank namespaces.
         # candidate_meta stores the (group, hash_bytes) for key slice.
         candidate_keys: list[str] = []
         candidate_meta: list[tuple[int, bytes]] = []
+        exists_set: set[tuple[int, bytes]] = set()
         lookup_masks = self.coord.lookup_mask(token_len)
         for g_idx, db in enumerate(self.token_dbs):
             spec_block_size = db.block_size
@@ -1482,15 +1490,25 @@ class MooncakeStoreWorker:
                 if lookup_mask is not None and not lookup_mask[chunk_id]:
                     continue
                 h = group_hashes[chunk_id]
-                hash_hex = h.hex()
+                hash_bytes = bytes(h)
+                if (chunk_id + 1) * spec_block_size <= known_local_hit_tokens:
+                    exists_set.add((g_idx, hash_bytes))
+                    continue
+                hash_hex = hash_bytes.hex()
                 for key_prefix in key_prefixes:
                     candidate_keys.append(
                         PoolKey.build_key_string(key_prefix, hash_hex)
                     )
-                candidate_meta.append((g_idx, bytes(h)))
+                candidate_meta.append((g_idx, hash_bytes))
 
         if not candidate_keys:
-            return 0
+            if not exists_set:
+                return 0
+            return self.coord.find_longest_cache_hit(
+                block_hashes,
+                token_len,
+                ExternalCachedBlockPool(self.hash_block_size, exists_set),
+            )[1]
 
         lookup_start = time.perf_counter()
         try:
@@ -1513,14 +1531,14 @@ class MooncakeStoreWorker:
 
         # A (group, hash) is "present" only when every TP*PP rank has it.
         ranks_per_candidate = self._lookup_expected_per_key
-        exists_set = {
+        exists_set.update(
             (g_idx, hash_bytes)
             for i, (g_idx, hash_bytes) in enumerate(candidate_meta)
             if all(
                 res[i * ranks_per_candidate + j] == 1
                 for j in range(ranks_per_candidate)
             )
-        }
+        )
 
         _masks, hit_length = self.coord.find_longest_cache_hit(
             block_hashes,
@@ -1593,10 +1611,15 @@ class LookupKeyServer:
 
                 if msg_type == LOOKUP_MSG:
                     token_len = int.from_bytes(all_frames[1], byteorder="big")
-                    hash_len = int.from_bytes(all_frames[2], byteorder="big")
-                    blob = all_frames[3].buffer
+                    known_local_hit_tokens = int.from_bytes(
+                        all_frames[2], byteorder="big"
+                    )
+                    hash_len = int.from_bytes(all_frames[3], byteorder="big")
+                    blob = all_frames[4].buffer
                     block_hashes = BlobBlockHashes(blob, hash_len)
-                    result = self.store_worker.lookup(token_len, block_hashes)
+                    result = self.store_worker.lookup(
+                        token_len, block_hashes, known_local_hit_tokens
+                    )
                     self.socket.send(result.to_bytes(4, "big"))
 
                 elif msg_type == RESET_MSG:
@@ -1658,12 +1681,19 @@ class LookupKeyClient:
             max_workers=1, thread_name_prefix="MooncakeLookupClient"
         )
         self.futures: dict[str, Future[int]] = {}
+        self.future_boundaries: dict[str, int] = {}
 
-    def _lookup(self, token_len: int, block_hashes: list[BlockHash]) -> int:
+    def _lookup(
+        self,
+        token_len: int,
+        block_hashes: list[BlockHash],
+        known_local_hit_tokens: int,
+    ) -> int:
         hash_len = len(block_hashes[0]) if block_hashes else 0
         all_frames = (
             LOOKUP_MSG,
             token_len.to_bytes(4, byteorder="big"),
+            known_local_hit_tokens.to_bytes(4, byteorder="big"),
             hash_len.to_bytes(2, byteorder="big"),
             b"".join(block_hashes),
         )
@@ -1676,14 +1706,31 @@ class LookupKeyClient:
         req_id: str,
         token_len: int,
         block_hashes: list[BlockHash],
+        known_local_hit_tokens: int = 0,
         non_block: bool = False,
     ) -> int | None:
         """If non_block is True, will return None until the result is ready,
         so the caller retries on a later step."""
         future = self.futures.get(req_id)
+        if (
+            future is not None
+            and self.future_boundaries[req_id] != known_local_hit_tokens
+        ):
+            # The scheduler recomputes local prefix hits while an async lookup is
+            # pending, so the same request can change the known-local boundary.
+            self.futures.pop(req_id)
+            self.future_boundaries.pop(req_id)
+            future.cancel()
+            future = None
         if future is None:
-            future = self.executor.submit(self._lookup, token_len, list(block_hashes))
+            future = self.executor.submit(
+                self._lookup,
+                token_len,
+                list(block_hashes),
+                known_local_hit_tokens,
+            )
             self.futures[req_id] = future
+            self.future_boundaries[req_id] = known_local_hit_tokens
         if non_block and not future.done():
             return None
         try:
@@ -1692,11 +1739,15 @@ class LookupKeyClient:
             logger.error("Async Mooncake lookup failed for %s: %s", req_id, e)
             return 0
         finally:
-            del self.futures[req_id]
+            # Do not remove a newer Future installed by a changed-query retry.
+            if self.futures.get(req_id) is future:
+                self.futures.pop(req_id)
+                self.future_boundaries.pop(req_id)
 
     def discard(self, req_id: str) -> None:
         """Drop any cached/in-flight lookup for ``req_id`` (e.g. on abort)."""
         future = self.futures.pop(req_id, None)
+        self.future_boundaries.pop(req_id, None)
         if future is not None:
             future.cancel()
 
@@ -1717,6 +1768,7 @@ class LookupKeyClient:
 
     def close(self):
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.future_boundaries.clear()
         self.socket.close(linger=0)
 
 

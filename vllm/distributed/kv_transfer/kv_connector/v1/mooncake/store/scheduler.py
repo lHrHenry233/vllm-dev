@@ -47,6 +47,8 @@ def _new_req_prefill_tokens(request: NewRequestData) -> list[int]:
 class MooncakeStoreScheduler:
     """Scheduler-side component for MooncakeStoreConnector."""
 
+    _known_local_prefix_is_common = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -63,6 +65,9 @@ class MooncakeStoreScheduler:
         self._block_size, self._hash_block_size = resolve_kv_cache_block_sizes(
             kv_cache_config, vllm_config
         )
+        # The core scheduler passes max(per_group_hits) for Mamba hybrids, so
+        # that value is not guaranteed to be present in every cache group.
+        self._known_local_prefix_is_common = not kv_cache_config.has_mamba_layers
 
         # Per-request state
         self.load_specs: dict[str, LoadSpec] = {}  # to be loaded
@@ -85,12 +90,31 @@ class MooncakeStoreScheduler:
         if token_len < self._block_size:
             return 0, False
 
-        num_external_hit_tokens = self.client.lookup(
-            request.request_id,
-            token_len,
-            request.block_hashes,
-            non_block=self.lookup_async,
+        known_local_tokens = (
+            min(num_computed_tokens, token_len)
+            if self._known_local_prefix_is_common
+            else 0
         )
+        known_local_tokens = known_local_tokens // self._block_size * self._block_size
+        if known_local_tokens == token_len:
+            self.client.discard(request.request_id)
+            return 0, False
+
+        if known_local_tokens:
+            num_external_hit_tokens = self.client.lookup(
+                request.request_id,
+                token_len,
+                request.block_hashes,
+                known_local_tokens,
+                non_block=self.lookup_async,
+            )
+        else:
+            num_external_hit_tokens = self.client.lookup(
+                request.request_id,
+                token_len,
+                request.block_hashes,
+                non_block=self.lookup_async,
+            )
         if num_external_hit_tokens is None:
             # Lookup not ready yet; scheduler will retry on a later step.
             return None, False
