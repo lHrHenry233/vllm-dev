@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    SparseFullAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -266,7 +267,8 @@ def resolve_kv_cache_layout(
     Runs once in the engine core. Every worker reports the layouts its backends
     support, most preferred first (``get_supported_kv_cache_layouts``); all
     ranks run the same backends, so their lists must agree. Specs mixing HNC
-    shapes narrow the candidates to block-compact layouts. An explicit
+    shapes narrow the candidates to block-compact layouts. HiSparse full K/V
+    requires BLNHC so each token's heads form one contiguous copy row. An explicit
     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
     connector's preference is used when compatible and dropped with a warning
@@ -286,12 +288,25 @@ def resolve_kv_cache_layout(
         f"Workers disagree on supported KV cache layouts: {supported_layouts}."
     )
     candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    kv_cache_specs = tuple(kv_cache_specs or ())
+    if (
+        any(isinstance(spec, SparseFullAttentionSpec) for spec in kv_cache_specs)
+        and vllm_config.attention_config.hisparse_config is not None
+    ):
+        candidates = [layout for layout in candidates if layout is KVCacheLayout.BLNHC]
+        if not candidates:
+            raise ValueError(
+                "HiSparse sparse full attention requires BLNHC for contiguous "
+                "token rows, but it is not supported by every worker: "
+                f"{supported_layouts}."
+            )
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of
     # bytes is the same. If not block-compact, each spec must agree on HNC to alias
     # the same page (this aliasing is done by the Hybrid Memory Allocator, HMA).
-    kv_cache_specs = tuple(kv_cache_specs or ())
+    # Specs without per-layer views lay out their own raw backing tensor.
+    kv_cache_specs = tuple(spec for spec in kv_cache_specs if spec.has_layer_views)
     hnc_shapes = {
         (spec.num_heads, spec.num_states, spec.page_size_bytes)
         for spec in kv_cache_specs
@@ -1162,11 +1177,6 @@ def mamba_get_block_table_tensor(
     """Get the block table tensor for mamba kernels from the input
     common_attn_metadata.block_table_tensor given different mamba cache modes.
 
-    - "all":   input  (#requests, cdiv(max_model_len, block_size)
-                        + num_speculative_blocks);
-               output (#requests, cdiv(max_model_len, block_size)
-                        + num_speculative_blocks).
-
     - "none":  input  (#requests, 1 + num_speculative_blocks);
                output (#requests, 1 + num_speculative_blocks).
 
@@ -1174,7 +1184,7 @@ def mamba_get_block_table_tensor(
                output (#requests, 1 + num_speculative_blocks), which are the last
                1 + num_speculative_blocks of each request.
     """
-    if mamba_cache_mode in ("all", "none"):
+    if mamba_cache_mode == "none":
         return block_table
     else:
         assert isinstance(kv_cache_spec, MambaSpec)

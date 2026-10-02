@@ -7,15 +7,12 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.models.config import (
     Qwen3_5ForConditionalGenerationConfig,
     Qwen4ExpForConditionalGenerationConfig,
-)
-from vllm.models.qwen4_exp.config import (
-    Qwen4ExpConfig,
-    Qwen4ExpTextConfig,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -37,7 +34,10 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
         "linear_num_value_heads": 2,
         "linear_key_head_dim": 8,
         "linear_value_head_dim": 8,
-        "num_experts": 0,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        # `Qwen4ExpTextConfig` requires an EOS token whenever PLE is enabled.
+        "eos_token_id": 1,
         "hc_count": 2,
         "hc_lowrank": 4,
         "ple_layer_ids": [1],
@@ -46,6 +46,40 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.parametrize("hisparse", [False, True])
+def test_qsa_compressed_keys_are_not_hisparse_host_sources(hisparse: bool) -> None:
+    """Enabling main-KV offload must keep the compressed indexer on device."""
+    from vllm.config import AttentionConfig, CacheConfig, HiSparseConfig
+    from vllm.models.qwen4_exp.common.qsa_cache import QSACompressedKeyCache
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
+
+    config = SimpleNamespace(
+        attention_config=AttentionConfig(
+            hisparse_config=HiSparseConfig() if hisparse else None
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    cache = QSACompressedKeyCache(
+        head_size=128,
+        dtype=torch.bfloat16,
+        cache_config=CacheConfig(block_size=64),
+        prefix="qsa.indexer.compressed",
+        vllm_config=config,
+        compress_ratio=4,
+    )
+
+    spec = cache.get_kv_cache_spec(config)
+
+    assert spec == MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+        cache_role=SparseCacheRole.INDEXER if hisparse else SparseCacheRole.SPARSE,
+    )
 
 
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
