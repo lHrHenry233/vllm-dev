@@ -3241,7 +3241,8 @@ def test_hisparse_prefill_staging_plan_resolves_resident_sources():
         [[11, 12, 0, 13, 0, 0], [21, 0, 22, 23, 0, 0]], dtype=torch.int32
     )
 
-    plan.ensure_gpu_sources(resident_table, resident_block_size)
+    state_indices = torch.arange(2, dtype=torch.int32)
+    plan.ensure_gpu_sources(resident_table, state_indices, resident_block_size)
 
     assert plan.gpu_row_ids is not None
     unique_hosts = (plan.row_ids[0].view(-1, block_size)[:, 0] // block_size).tolist()
@@ -3271,10 +3272,49 @@ def test_hisparse_prefill_staging_plan_resolves_resident_sources():
         check_dtype=False,
     )
 
-    plan.ensure_gpu_sources(torch.zeros_like(resident_table), resident_block_size)
+    plan.ensure_gpu_sources(
+        torch.zeros_like(resident_table), state_indices, resident_block_size
+    )
 
     assert plan.gpu_row_ids is not None
     assert (plan.gpu_row_ids == -1).all()
+
+
+def test_hisparse_prefill_resident_sources_follow_each_resident_group():
+    """Layers of different resident groups share one batch staging plan.
+
+    Each group's layers must stage from that group's resident blocks. Keying
+    the plan's cached resident sources on a per-call batch gather let a later
+    group's gather reuse the freed address of an earlier one, so its layers
+    read the earlier group's block ids.
+    """
+    block_size = 4
+    plan = build_hisparse_prefill_staging_plan(
+        torch.tensor([[5, 2]], dtype=torch.int32),
+        torch.tensor([8], dtype=torch.int32),
+        block_size,
+        staging_block_capacity=2,
+    )
+    # The prefill runs in request state row 1; one table holds both groups.
+    # Rows are wide so that a cache keyed on a freed per-call gather of a row
+    # would see the next gather reuse its address.
+    state_rows = torch.zeros((4, 2, 1024), dtype=torch.int32)
+    state_rows[1, 0, :2] = torch.tensor([11, 12])
+    state_rows[1, 1, :2] = torch.tensor([21, 22])
+    state_indices = torch.tensor([1], dtype=torch.int32)
+    host_ids = (plan.row_ids[0].view(-1, block_size)[:, 0] // block_size).tolist()
+
+    for group in (0, 1, 0, 1):
+        plan.ensure_gpu_sources(state_rows[:, group], state_indices, block_size)
+        assert plan.gpu_row_ids is not None
+        gpu_blocks = plan.gpu_row_ids[0].view(-1, block_size)[:, 0] // block_size
+        staged = {
+            host_id: gpu_block
+            for host_id, gpu_block in zip(host_ids, gpu_blocks.tolist())
+            if host_id > 0
+        }
+        first_page, second_page = state_rows[1, group, :2].tolist()
+        assert staged == {5: first_page, 2: second_page}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3294,7 +3334,11 @@ def test_hisparse_gather_prefill_cache_prefers_resident_rows():
         dtype=torch.int32,
         device=device,
     )
-    plan.ensure_gpu_sources(resident_table, resident_block_size)
+    plan.ensure_gpu_sources(
+        resident_table,
+        torch.arange(2, dtype=torch.int32, device=device),
+        resident_block_size,
+    )
 
     num_host_blocks, num_res_blocks = 10, 24
     host_cache = (
@@ -3677,6 +3721,7 @@ def test_hisparse_resident_prefill_uses_attention_block_stride():
         all_context_pages_resident=True,
         view=SimpleNamespace(block_size=64, attention_block_stride=832),
         block_table=torch.tensor([[3]], dtype=torch.int32),
+        batch_block_table=lambda: torch.tensor([[3]], dtype=torch.int32),
         runtime=SimpleNamespace(max_swap_rows=1),
     )
     index_group = object.__new__(HiSparseMLAIndexGroup)
@@ -4091,6 +4136,7 @@ def test_hisparse_prefill_reuses_builder_staging_plan():
     cache = SimpleNamespace(
         runtime=SimpleNamespace(
             gather_prefill_cache=gather,
+            request_state_indices=torch.tensor([0], dtype=torch.int32),
         ),
         view=SimpleNamespace(cache=resident_cache, block_size=1),
         block_table=resident_block_table,
@@ -4113,10 +4159,6 @@ def test_hisparse_prefill_reuses_builder_staging_plan():
     assert result is staged
     assert block_table is plan.block_table
     torch.testing.assert_close(request_ids, metadata.req_id_per_token)
-    plan.ensure_gpu_sources.assert_called_once()
-    args = plan.ensure_gpu_sources.call_args.args
-    torch.testing.assert_close(args[0], resident_block_table)
-    assert args[1] == 1
     assert calls == [(source, plan, resident_cache)]
 
 
@@ -4134,6 +4176,9 @@ def test_hisparse_fp8_prefill_gather_uses_dedicated_stream(monkeypatch):
     cache = SimpleNamespace(
         view=SimpleNamespace(cache=resident_cache, block_size=4),
         block_table=torch.tensor([[2, 3]], dtype=torch.int32),
+        runtime=SimpleNamespace(
+            request_state_indices=torch.tensor([0], dtype=torch.int32)
+        ),
     )
     index_group = object.__new__(HiSparseMLAIndexGroup)
     index_group.caches = [cache]
@@ -4178,10 +4223,6 @@ def test_hisparse_fp8_prefill_gather_uses_dedicated_stream(monkeypatch):
     assert args.kwargs["host_cache"].data_ptr() == source.data_ptr()
     assert args.kwargs["host_row_ids"] is plan.row_ids
     assert args.kwargs["device_row_ids"] is plan.gpu_row_ids
-    plan.ensure_gpu_sources.assert_called_once()
-    ensure_args = plan.ensure_gpu_sources.call_args.args
-    torch.testing.assert_close(ensure_args[0], cache.block_table)
-    assert ensure_args[1] == 4
 
 
 def test_sparse_impl_observes_repointed_indexer_buffer():
@@ -4223,3 +4264,183 @@ def test_sparse_mla_common_impl_resolves_buffer_lazily():
     assert isinstance(SparseMLACommonImpl.topk_indices_buffer, property), (
         "topk_indices_buffer must stay a lazily-resolved property"
     )
+
+
+@requires_hisparse_ops
+def test_hisparse_qsa_reused_request_slot_refills_all_independent_kv_layers():
+    """A new owner of a host block cannot hit the old owner's full K/V rows."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
+        HiSparseConnectorMetadata,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
+        HiSparseConnectorWorker,
+    )
+    from vllm.v1.hisparse.runtime import (
+        HiSparseCacheHandle,
+        HiSparseRuntime,
+        ResolvedHiSparseConfig,
+    )
+    from vllm.v1.hisparse.types import SparseKVResidencyUpdate
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.worker.gpu.states import RequestState
+
+    device = torch.device("cuda")
+    block_size, heads, head_dim = 64, 2, 64
+    row_width = heads * 2 * head_dim
+    block_bytes = block_size * row_width * torch.bfloat16.itemsize
+    states = RequestState(
+        max_num_reqs=2,
+        max_model_len=64,
+        max_num_batched_tokens=2,
+        num_speculative_steps=0,
+        vocab_size=128,
+        device=device,
+    )
+    for name in ("old", "peer"):
+        states.add_request(name, 1, [1], 0, 4)
+    states.apply_staged_writes()
+    old_slot = states.req_id_to_index["old"]
+    peer_slot = states.req_id_to_index["peer"]
+    mapping = torch.full((2,), -1, dtype=torch.int32, device=device)
+    residency = torch.zeros((2, 1, 1), dtype=torch.int32, device=device)
+    # The HMA slab is shared, while hot groups own different allocation blocks.
+    backing = torch.zeros(6 * block_bytes, dtype=torch.uint8, device=device)
+    handles, host_pools = [], []
+    for layer in range(2):
+        runtime = HiSparseRuntime(
+            ResolvedHiSparseConfig(top_k=2, device_buffer_size=4, max_union_rows=2),
+            max_num_reqs=2,
+            row_width=row_width,
+            kv_dtype=torch.bfloat16,
+            device=device,
+        )
+        runtime.bind_hot_cache(
+            backing,
+            byte_offset=0,
+            block_stride=block_bytes,
+            num_blocks=6,
+            block_size=block_size,
+            block_table=torch.arange(
+                1 + 2 * layer, 3 + 2 * layer, dtype=torch.int32, device=device
+            )[:, None],
+        )
+        runtime.request_state_indices = mapping
+        # Each QSA layer leads its own index group and carries every K/V head.
+        assert runtime.is_group_leader
+        host = (
+            torch.arange(3 * block_size * row_width, dtype=torch.float32, device="cpu")
+            .remainder(29)
+            .add(layer * 32)
+            .to(torch.bfloat16)
+            .reshape(3, block_size, row_width)
+            .pin_memory()
+        )
+        runtime.bind_source_cache(host)
+        handle = HiSparseCacheHandle(runtime)
+        handle.bind_cache(
+            backing,
+            byte_offset=0,
+            block_stride=block_bytes,
+            num_blocks=6,
+            block_size=block_size,
+            block_table=residency[:, 0],
+            slot_mapping=torch.zeros(2, dtype=torch.int64, device=device),
+        )
+        handle.residency = residency
+        handles.append(handle)
+        host_pools.append(host)
+    assert handles[0].runtime.index_group is not handles[1].runtime.index_group
+    worker = HiSparseConnectorWorker(
+        SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=2),
+            num_lookahead_tokens=0,
+        ),
+        KVCacheConfig(num_blocks=6, kv_cache_tensors=[], kv_cache_groups=[]),
+    )
+    worker.initialize(
+        handles,
+        ["qsa.layer.0", "qsa.layer.1"],
+        handles[0].runtime.hot_backing,
+        2,
+        3,
+        device,
+        host_pools,
+    )
+
+    def start(names, new_host_blocks):
+        worker.start_step(
+            HiSparseConnectorMetadata(
+                None,
+                (),
+                new_host_blocks,
+                {},
+                False,
+                {name: SparseKVResidencyUpdate([0], ([0],)) for name in names},
+            ),
+            torch.tensor(
+                [states.req_id_to_index[name] for name in names],
+                dtype=torch.int32,
+                device=device,
+            ),
+            request_ids=names,
+        )
+
+    def read(handle, source_blocks, selected):
+        handle.runtime.begin_forward()
+        indices, counts = handle.swap_in(
+            req_id_per_token=torch.arange(2, dtype=torch.int32, device=device),
+            block_table=torch.tensor(source_blocks, dtype=torch.int32, device=device)[
+                :, None
+            ],
+            logical_topk_indices=torch.tensor(
+                selected, dtype=torch.int32, device=device
+            ),
+            block_size=block_size,
+            num_valid_rows=torch.tensor([2], dtype=torch.int32, device=device),
+            return_valid_counts=True,
+        )
+        torch.accelerator.synchronize()
+        assert counts.tolist() == [2, 2]
+        return handle.runtime.hot.attention_cache.reshape(-1, row_width)[
+            indices.long()
+        ].cpu()
+
+    start(["old", "peer"], (1, 2))
+    old_rows, peer_mappings, before_misses = [], [], []
+    for handle, host in zip(handles, host_pools):
+        actual = read(handle, [1, 2], [[3, 7], [5, 9]])
+        expected = torch.stack((host[1, [3, 7]], host[2, [5, 9]]))
+        torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8))
+        old_rows.append(actual[0].clone())
+        group = handle.runtime.index_group
+        assert {block_size + 3, block_size + 7} <= set(
+            group.device_global_indices[old_slot].tolist()
+        )
+        peer_mappings.append(group.device_global_indices[peer_slot].clone())
+        before_misses.append(int(group.swap_stats[1].item()))
+
+    assert states.remove_request("old") == old_slot
+    states.add_request("replacement", 1, [2], 0, 4)
+    states.apply_staged_writes()
+    assert states.req_id_to_index["replacement"] == old_slot
+    for host in host_pools:
+        host[1].add_(128)
+    # Hot tables follow batch order, while residency and identities use state slots.
+    for handle in handles:
+        hot_table = handle.runtime.hot_block_table
+        hot_table.copy_(hot_table.flip(0))
+    # Reorder batch rows as well as replacing the request, so batch row != state slot.
+    start(["peer", "replacement"], (1,))
+    assert mapping.tolist() == [peer_slot, old_slot]
+    for layer, (handle, host) in enumerate(zip(handles, host_pools)):
+        group = handle.runtime.index_group
+        assert (group.device_global_indices[old_slot] == -1).all()
+        torch.testing.assert_close(
+            group.device_global_indices[peer_slot], peer_mappings[layer]
+        )
+        actual = read(handle, [2, 1], [[5, 9], [3, 7]])
+        expected = torch.stack((host[2, [5, 9]], host[1, [3, 7]]))
+        assert not torch.equal(actual[1], old_rows[layer])
+        torch.testing.assert_close(actual.view(torch.uint8), expected.view(torch.uint8))
+        assert int(group.swap_stats[1].item()) - before_misses[layer] == 2
+    torch.accelerator.synchronize()

@@ -71,12 +71,6 @@ else:
 
 logger = init_logger(__name__)
 
-# TODO(rocm): These models are either unsupported by MRV2 or slower with
-# MRV2 on AMD GPUs.
-ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset(
-    {"DeepseekV32ForCausalLM", "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"}
-)
-
 DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
         "DeepseekV32MTPModel",
@@ -726,30 +720,6 @@ class VllmConfig:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
             return use_v2_model_runner
-
-        from vllm.platforms import current_platform
-
-        model_config = self.model_config
-        if model_config is not None and current_platform.is_rocm():
-            architectures = getattr(model_config, "architectures", ())
-            if any(arch in ROCM_DEFAULT_MRV1_ARCHITECTURES for arch in architectures):
-                # This default is a speed preference, not a claim that V1 can
-                # serve the config, so it yields where V1 cannot. It yields by
-                # falling through to the checks below, not by selecting V2.
-                v1_unsupported = self._get_v1_model_runner_unsupported_features()
-                if not v1_unsupported:
-                    logger.warning_once(
-                        "Defaulting to V1 model runner on ROCm for model "
-                        "architectures: %s",
-                        ", ".join(architectures),
-                    )
-                    return False
-                logger.warning_once(
-                    "Skipping the ROCm V1 model runner default for %s: V1 does "
-                    "not support %s.",
-                    ", ".join(architectures),
-                    ", ".join(v1_unsupported),
-                )
 
         if not HAS_TRITON:
             logger.warning_once(
@@ -1859,12 +1829,29 @@ class VllmConfig:
                     "HiSparse requires --scheduler-reserve-full-isl; remove "
                     "--no-scheduler-reserve-full-isl."
                 )
-            if self.model_config is not None and not hasattr(
-                self.model_config.hf_config, "index_topk"
-            ):
-                raise ValueError(
-                    "HiSparse is only supported for DSA models with index_topk."
+            if self.model_config is not None:
+                hf_text_config = self.model_config.hf_text_config
+                is_qsa = (
+                    hf_text_config.model_type in ("qwen4_exp_text", "qwen4_exp_mtp")
+                    and getattr(hf_text_config, "indexer_n_heads", None) is not None
+                    and any(
+                        layer_type
+                        in (
+                            "full_attention",
+                            "qwen_sparse_attention",
+                            "indexed_attention",
+                        )
+                        for layer_type in getattr(hf_text_config, "layer_types", ())
+                    )
                 )
+                if (
+                    not hasattr(self.model_config.hf_config, "index_topk")
+                    and not is_qsa
+                ):
+                    raise ValueError(
+                        "HiSparse is only supported for DSA models with index_topk "
+                        "or Qwen4Exp QSA models."
+                    )
             if self.kv_transfer_config is not None and (
                 self.kv_transfer_config.kv_connector
                 not in (
