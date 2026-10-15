@@ -6597,6 +6597,7 @@ def test_qsa_partial_prefix_cow_restores_a_private_writable_tail(
     assert manager.get_block_ids(producer.request_id) == original_ids
     assert source_tail.ref_cnt == 1
     manager.free(producer)
+    assert not coordinator.has_pending_work()
     assert (
         manager.block_pool.get_num_free_blocks(),
         host_pool.get_num_free_blocks(),

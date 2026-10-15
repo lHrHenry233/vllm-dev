@@ -5028,3 +5028,42 @@ def test_rocm_fused_v32_dense_prefill_matches_mqa(
                 rtol=0.01,
                 atol=0.01,
             )
+
+
+def test_hisparse_selected_staging_follows_request_state_after_reorder(monkeypatch):
+    """Selected rows use stable residency, host misses, and no padding state."""
+    runtime = object.__new__(HiSparseRuntime)
+    runtime.row_width = 1
+    runtime._host_cache = torch.arange(100, 106, dtype=torch.float32)[:, None]
+    runtime.request_state_indices = torch.tensor([2, 0, -1], dtype=torch.int32)
+    cache = HiSparseCacheHandle(runtime)
+    cache.view = SimpleNamespace(
+        block_size=2,
+        cache=torch.tensor(
+            [[700, 701], [710, 711], [720, 721], [-30, -31], [-40, -41]],
+            dtype=torch.float32,
+        )[:, :, None],
+    )
+    cache.block_table = torch.tensor([[4, 0], [1, 2], [3, 0]], dtype=torch.int32)
+    cache.source_block_table = torch.tensor([[1, 2], [2, 1], [1, 2]], dtype=torch.int32)
+
+    def gather_host_rows(host, staged, source_rows, destinations, misses, *args):
+        # CPU stand-in for the native memcpy boundary, not CUDA/DMA validation.
+        copy = (misses > 0) & (source_rows >= 0)
+        staged.view(-1, 1)[destinations[copy].long()] = host[source_rows[copy].long()]
+
+    monkeypatch.setattr(
+        torch.ops._C_cache_ops, "hisparse_gather_plan", gather_host_rows, raising=False
+    )
+    staged, indices = runtime.gather_selected_cache(
+        cache,
+        torch.tensor([0, 1, 2, -1], dtype=torch.int32),
+        torch.tensor([[0, 1, 2]] * 4, dtype=torch.int32),
+        torch.tensor([3, 2, 3, 3], dtype=torch.int32),
+    )
+
+    assert indices.tolist() == [[0, 1, 2], [4, 5, -1], [-1] * 3, [-1] * 3]
+    torch.testing.assert_close(
+        staged.view(-1, 1)[torch.tensor([0, 1, 2, 4, 5])],
+        torch.tensor([[-30], [-31], [104], [-40], [-41]], dtype=torch.float32),
+    )

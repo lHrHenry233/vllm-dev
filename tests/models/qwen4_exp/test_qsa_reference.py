@@ -3575,3 +3575,54 @@ def test_qsa_streaming_compression_and_compressor_state_store_match_reference() 
                 rope_cache[block, position % 4, 0],
                 position_row(request, position).to("cuda"),
             )
+
+
+@pytest.mark.parametrize("capture", [False, True], ids=["warmup", "capture"])
+def test_qsa_hisparse_padding_forward_preserves_resident_cache(capture: bool) -> None:
+    """Padding uses the current cache handle without writing or mirror staging."""
+    from functools import partial
+
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+    from vllm.v1.hisparse.runtime import HiSparseCacheHandle
+
+    cache = HiSparseCacheHandle(
+        SimpleNamespace(
+            is_group_leader=True,
+            begin_forward=lambda: None,
+            max_num_reqs=1,
+            eager_host_mirror=False,
+        )
+    )
+    resident = torch.full((2, 16, 2), 7, dtype=torch.bfloat16)
+    cache.view = SimpleNamespace(cache=resident)
+    cache.block_table = torch.zeros((1, 1), dtype=torch.int32)
+    cache.slot_mapping = torch.full((1,), -1, dtype=torch.int64)
+
+    def write_cache(layer, key, value, kv_cache, slots):
+        # CPU stand-in for the GPU write boundary; no active rows reach it.
+        assert key.shape[0] == value.shape[0] == slots.numel() == 0
+
+    owner = SimpleNamespace(
+        hisparse_cache=cache,
+        num_kv_heads=1,
+        head_dim=1,
+        impl=SimpleNamespace(do_kv_cache_update=write_cache),
+    )
+    owner._hisparse_kv_view = partial(Qwen4ExpQSAAttention._hisparse_kv_view, owner)
+    metadata = SimpleNamespace(
+        num_actual_tokens=0,
+        num_decode_tokens=0,
+        max_query_len=1,
+        num_reqs=0,
+        req_id_per_token=torch.full((1,), -1, dtype=torch.int32),
+        slot_mapping=cache.slot_mapping,
+        is_cudagraph_capture=capture,
+    )
+    rows = torch.ones((1, 1, 1), dtype=torch.bfloat16)
+    output = torch.full_like(rows, 9)
+    Qwen4ExpQSAAttention._forward_hisparse(
+        owner, rows, rows, rows, output, rows, metadata
+    )
+
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    torch.testing.assert_close(resident, torch.full_like(resident, 7))
