@@ -2454,3 +2454,97 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
+
+
+def test_hisparse_worker_specs_allow_unresolved_hybrid_layout(monkeypatch):
+    """Workers derive sparse caches before core resolves the hybrid layout."""
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+    from vllm.v1.hisparse.binding import resolve_hisparse_specs
+    from vllm.v1.kv_cache_interface import SparseFullAttentionSpec
+
+    monkeypatch.setattr(
+        hisparse_runtime_module.current_platform, "is_cuda_alike", lambda: True
+    )
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    sparse_specs = {
+        "qsa": SparseFullAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            total_num_kv_heads=2,
+            head_size=64,
+            dtype=torch.bfloat16,
+            top_k=2048,
+        ),
+        "qsa.indexer": MLAAttentionSpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+            cache_role=SparseCacheRole.INDEXER,
+        ),
+    }
+    regular_specs = {
+        "qsa.raw_keys": CircularBufferSpec(
+            block_size=4,
+            num_kv_heads=1,
+            head_size=128,
+            head_size_v=0,
+            dtype=torch.bfloat16,
+        ),
+        "gdn": MambaSpec(
+            block_size=64,
+            shapes=((4, 8), (2, 8)),
+            dtypes=(torch.bfloat16, torch.float32),
+            mamba_cache_mode="align",
+        ),
+        "ple": MambaSpec(
+            block_size=64,
+            shapes=((3, 16),),
+            dtypes=(torch.bfloat16,),
+            mamba_cache_mode="align",
+            tp_replicated=True,
+        ),
+    }
+    config = _grouping_config()
+    config.cache_config.kv_cache_layout = None
+    config.attention_config = SimpleNamespace(hisparse_config=HiSparseConfig())
+    config.model_config = SimpleNamespace(hf_config=SimpleNamespace())
+    config.kv_transfer_config = None
+    config.scheduler_config.async_scheduling = False
+    # Exercise common-block resolution rather than retaining the input size.
+    backend = SimpleNamespace(get_supported_kernel_block_sizes=lambda _=None: [32])
+    layers = {
+        name: SimpleNamespace(get_attn_backend=lambda: backend) for name in sparse_specs
+    }
+    reported = resolve_hisparse_specs(config, sparse_specs | regular_specs, layers)
+    assert config.cache_config.kv_cache_layout is None
+    assert all(reported[name].block_size == 32 for name in sparse_specs)
+    assert all(reported[name] is spec for name, spec in regular_specs.items())
+    derived = {
+        name: spec
+        for name, spec in reported.items()
+        if isinstance(spec, (HiSparseResidentSpec, HiSparseHotSpec))
+    }
+    assert set(derived) == {"qsa.hisparse_resident", "qsa.hisparse_hot"}
+    assert all(spec.block_size == 32 for spec in derived.values())
+
+    resolve_kv_cache_layout(config, [["BLNHC"]], reported.values())
+    grouped = get_kv_cache_groups(config, reported)
+    assert {
+        name: group.kv_cache_spec
+        for group in grouped
+        if isinstance(group.kv_cache_spec, (HiSparseResidentSpec, HiSparseHotSpec))
+        for name in group.layer_names
+    } == derived
+    assert {name for group in grouped for name in group.layer_names} == set(reported)
+    for group in grouped:
+        for name in group.layer_names:
+            if isinstance(regular_specs.get(name), MambaSpec):
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = spec.kv_cache_specs[name]
+                assert isinstance(spec, MambaSpec)
+                assert spec.shapes == regular_specs[name].shapes
+                assert spec.dtypes == regular_specs[name].dtypes
+                assert spec.tp_replicated == regular_specs[name].tp_replicated

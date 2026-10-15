@@ -9,11 +9,16 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
     NixlBaseConnectorScheduler,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    NixlConnectorMetadata,
+    NixlConnectorWorkerMetadata,
+)
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
@@ -33,11 +38,52 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         # Actual reads outlive client cancellation and keep the producer lease.
         self._reqs_recving: set[str] = set()
+        self._pending_notifications: dict[str, int] = {}
+        self._failed_notifications: set[str] = set()
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> NixlConnectorMetadata:
+        meta = super().build_connector_meta(scheduler_output)
+        assert isinstance(meta, NixlConnectorMetadata)
+        for request_id, request in meta.reqs_to_recv.items():
+            if not request.awaiting_kvs and not any(request.local_block_ids):
+                self._pending_notifications.setdefault(request_id, 0)
+        return meta
+
+    def has_pending_push_work(self) -> bool:
+        # Notify-only requests may already be absent from the scheduler.
+        return bool(self._reqs_need_recv or self._pending_notifications)
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         for req_id in connector_output.finished_recving or ():
             self._reqs_recving.discard(req_id)
         super().update_connector_output(connector_output)
+        metadata = connector_output.kv_connector_worker_meta
+        if metadata is None:
+            return
+        assert isinstance(metadata, NixlConnectorWorkerMetadata)
+        expected = self.vllm_config.parallel_config.world_size
+        self._failed_notifications.update(
+            metadata.failed_notifications.keys() & self._pending_notifications.keys()
+        )
+        for counts in (
+            metadata.completed_notifications,
+            metadata.failed_notifications,
+        ):
+            for request_id, count in counts.items():
+                if request_id not in self._pending_notifications:
+                    continue
+                self._pending_notifications[request_id] += count
+                if self._pending_notifications[request_id] == expected:
+                    del self._pending_notifications[request_id]
+                    if request_id in self._failed_notifications:
+                        self._failed_notifications.remove(request_id)
+                        logger.warning(
+                            "Notify-only cleanup failed for request %s; "
+                            "producer release was not confirmed.",
+                            request_id,
+                        )
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
