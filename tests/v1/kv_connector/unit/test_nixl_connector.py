@@ -653,6 +653,150 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
         return remote_agents, 0.0
 
 
+def test_cancel_before_schedule_drains_cold_notification(
+    default_vllm_config, dist_init, monkeypatch
+):
+    """An aborted D request must keep progressing until P can release its lease."""
+    handshake_started = threading.Event()
+    release_handshake = threading.Event()
+    handshake_returned = threading.Event()
+    notifications: queue.Queue[bytes] = queue.Queue()
+    sent_notifications: list[bytes] = []
+    wrappers = []
+
+    class NotificationWrapper(FakeNixlWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            wrappers.append(self)
+
+        def send_notif(self, agent_name, notif_msg):
+            assert agent_name == self.REMOTE_AGENT_NAME
+            sent_notifications.append(notif_msg)
+            notifications.put(notif_msg)
+
+        def get_new_notifs(self):
+            if self is not wrappers[0]:
+                return {}
+            received = []
+            while not notifications.empty():
+                received.append(notifications.get_nowait())
+            return {"decode": received}
+
+        def make_prepped_xfer(self, *args, **kwargs):
+            pytest.fail("Notification-only cancellation must not submit a READ")
+
+    class DeferredHandshakeWorker(FakeNixlConnectorWorker):
+        def __init__(self, config, engine_id, kv_cache_config):
+            super().__init__(
+                config,
+                engine_id,
+                hand_shake_latency=0,
+                kv_cache_config=kv_cache_config,
+            )
+
+        def _nixl_handshake(self, *args, **kwargs):
+            handshake_started.set()
+            assert release_handshake.wait(10), "Test did not release the handshake"
+            try:
+                return super()._nixl_handshake(*args, **kwargs)
+            finally:
+                handshake_returned.set()
+
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        NotificationWrapper,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector."
+        "NixlPullConnectorWorker",
+        DeferredHandshakeWorker,
+    )
+    p_config = create_vllm_config(
+        kv_role="kv_producer", kv_connector_extra_config={"kv_lease_duration": 120}
+    )
+    p_config.kv_transfer_config.engine_id = FakeNixlConnectorWorker.REMOTE_ENGINE_ID
+    d_config = create_vllm_config()
+    p_scheduler = create_scheduler(p_config)
+    d_scheduler = create_scheduler(d_config)
+    cache_config = make_kv_cache_config(block_size=16)
+    p_connector = NixlConnector(p_config, KVConnectorRole.WORKER, cache_config)
+    d_connector = NixlConnector(d_config, KVConnectorRole.WORKER, cache_config)
+    context = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+
+    def worker_step(connector, schedule):
+        connector.bind_connector_metadata(schedule.kv_connector_metadata)
+        connector.start_load_kv(context)
+        results = connector.get_transfer_results(schedule.finished_req_ids)
+        assert not results.finished_recving and not results.failed_recving
+        output = create_model_runner_output(
+            [],
+            finished_sending=results.finished_sending,
+            finished_recving=results.finished_recving,
+            kv_connector_worker_meta=connector.build_connector_worker_meta(),
+        )
+        connector.clear_connector_metadata()
+        return output
+
+    def empty_step(scheduler, connector):
+        assert scheduler.has_requests(), (
+            "Cold cancellation notification lost its wakeup"
+        )
+        schedule = scheduler.schedule()
+        assert schedule.total_num_scheduled_tokens == 0
+        scheduler.update_from_output(schedule, worker_step(connector, schedule))
+
+    try:
+        p_pool = p_scheduler.kv_cache_manager.block_pool
+        initial_free = p_pool.get_num_free_blocks()
+        producer = create_request(request_id=61, num_tokens=32, do_remote_decode=True)
+        p_scheduler.add_request(producer)
+        schedule = p_scheduler.schedule()
+        model_output = create_model_runner_output([producer])
+        model_output.kv_connector_output = worker_step(
+            p_connector, schedule
+        ).kv_connector_output
+        outputs = p_scheduler.update_from_output(schedule, model_output)
+        handoff = outputs[0].outputs[0].kv_transfer_params
+        assert handoff is not None and handoff["do_remote_prefill"]
+        empty_step(p_scheduler, p_connector)
+        assert p_pool.get_num_free_blocks() < initial_free
+
+        decoder = create_request(request_id=62, num_tokens=32)
+        decoder.kv_transfer_params = handoff
+        d_scheduler.add_request(decoder)
+        d_scheduler.finish_requests(
+            [decoder.request_id], RequestStatus.FINISHED_ABORTED
+        )
+        empty_step(d_scheduler, d_connector)
+        assert handshake_started.wait(5)
+        assert not sent_notifications
+        assert not d_scheduler.has_unfinished_requests()
+        assert d_scheduler.has_requests(), (
+            "Cold cancellation notification lost its wakeup"
+        )
+
+        release_handshake.set()
+        assert handshake_returned.wait(5)
+        deadline = time.monotonic() + 5
+        while p_scheduler.has_requests() and time.monotonic() < deadline:
+            if d_scheduler.has_requests():
+                empty_step(d_scheduler, d_connector)
+            empty_step(p_scheduler, p_connector)
+            time.sleep(0.001)
+        assert sent_notifications == [f"{producer.request_id}:1".encode()]
+        assert not p_scheduler.has_requests()
+        assert not d_scheduler.has_requests()
+        assert p_pool.get_num_free_blocks() == initial_free
+    finally:
+        release_handshake.set()
+        if handshake_started.is_set():
+            assert handshake_returned.wait(5)
+        p_connector.shutdown()
+        d_connector.shutdown()
+        p_scheduler.get_kv_connector().shutdown()
+        d_scheduler.get_kv_connector().shutdown()
+
+
 class TestNixlHandshake:
     @pytest.mark.parametrize(
         ("pcp_rank", "pcp_size", "dcp_size", "expected_tracked"),
@@ -2273,10 +2417,14 @@ def recv_worker():
         remote_block_size=16, remote_physical_blocks_per_logical=1
     )
     worker._physical_blocks_per_logical_kv_block = 1
-    worker._recving_metadata = {"request": MagicMock(local_block_ids=([1, 2, 3],))}
+    worker._recving_metadata = {
+        "request": MagicMock(local_block_ids=([1, 2, 3],), region_blocks_to_zero=None)
+    }
     worker._recving_transfers = defaultdict(list)
     worker._failed_recv_reqs = queue.Queue()
     worker._recv_failures = set()
+    worker._pending_notifications = {}
+    worker._notification_results = {}
     worker._handshake_lock = threading.RLock()
     worker._handshake_futures = {}
     worker._remote_agents = {}
@@ -3649,6 +3797,211 @@ class FailingNixlWrapper(FakeNixlWrapper):
         return super().check_xfer_state(handle)
 
 
+@pytest.mark.parametrize("failure_stage", ["handshake", "notification"])
+def test_cancel_notification_failure_stops_scheduler_without_receiving(
+    default_vllm_config, dist_init, monkeypatch, caplog_vllm, failure_stage
+):
+    """Failed cleanup stops D's empty steps without claiming P released its KV."""
+    from errno import EAGAIN
+
+    started = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    handshake_succeeded = threading.Event()
+    sdk_events: list[
+        tuple[str, str] | tuple[str, str, str, int | None] | tuple[str, str, str, str]
+    ] = []
+
+    class ObservedFailingWrapper(FailingNixlWrapper):
+        def add_remote_agent(self, agent_metadata):
+            sdk_events.append(("handshake", "attempt"))
+            try:
+                result = super().add_remote_agent(agent_metadata)
+            except Exception as error:
+                sdk_events.append(
+                    (
+                        "handshake",
+                        "failed",
+                        type(error).__name__,
+                        getattr(error, "errno", None),
+                    )
+                )
+                raise
+            sdk_events.append(("handshake", "succeeded"))
+            return result
+
+        def send_notif(self, agent_name, notif_msg):
+            sdk_events.append(("notification", "attempt"))
+            try:
+                result = super().send_notif(agent_name, notif_msg)
+            except Exception as error:
+                sdk_events.append(
+                    ("notification", "failed", type(error).__name__, str(error))
+                )
+                raise
+            sdk_events.append(("notification", "succeeded"))
+            return result
+
+    class DeferredWorker(FakeNixlConnectorWorker):
+        def __init__(self, config, engine_id, kv_cache_config):
+            super().__init__(
+                config, engine_id, hand_shake_latency=0, kv_cache_config=kv_cache_config
+            )
+
+        def _nixl_handshake(self, *args, **kwargs):
+            started.set()
+            try:
+                assert release.wait(10), "Test did not release external handshake"
+                result = super()._nixl_handshake(*args, **kwargs)
+                handshake_succeeded.set()
+                return result
+            finally:
+                returned.set()
+
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        ObservedFailingWrapper,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector."
+        "NixlPullConnectorWorker",
+        DeferredWorker,
+    )
+    config = create_vllm_config()
+    scheduler = create_scheduler(config)
+    connector = NixlConnector(
+        config, KVConnectorRole.WORKER, make_kv_cache_config(block_size=16)
+    )
+    wrapper = connector.connector_worker.nixl_wrapper
+    wrapper.fail_handshake = failure_stage == "handshake"
+    wrapper.fail_send_notif = failure_stage == "notification"
+    context = ForwardContext(no_compile_layers={}, attn_metadata={}, slot_mapping={})
+    terminal = []
+
+    def step():
+        assert scheduler.has_requests(), "Cold cleanup lost its wakeup"
+        scheduled = scheduler.schedule()
+        assert scheduled.total_num_scheduled_tokens == 0
+        connector.bind_connector_metadata(scheduled.kv_connector_metadata)
+        connector.start_load_kv(context)
+        transfers = connector.get_transfer_results(scheduled.finished_req_ids)
+        assert not transfers.finished_sending
+        assert not transfers.finished_recving and not transfers.failed_recving
+        metadata = connector.build_connector_worker_meta()
+        if metadata is not None:
+            terminal.append(metadata)
+        assert connector.build_connector_worker_meta() is None
+        scheduler.update_from_output(
+            scheduled, create_model_runner_output([], kv_connector_worker_meta=metadata)
+        )
+        connector.clear_connector_metadata()
+
+    try:
+        pool = scheduler.kv_cache_manager.block_pool
+        initial_free = pool.get_num_free_blocks()
+        request = create_request(request_id=63, do_remote_prefill=True)
+        request.kv_transfer_params.update(
+            remote_engine_id=FakeNixlConnectorWorker.REMOTE_ENGINE_ID,
+            remote_block_ids=([20, 21, 22],),
+        )
+        scheduler.add_request(request)
+        scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+        step()
+        assert started.wait(5)
+        assert scheduler.has_requests(), "Cold cleanup lost its wakeup"
+        release.set()
+        assert returned.wait(5)
+        deadline = time.monotonic() + 5
+        while scheduler.has_requests() and time.monotonic() < deadline:
+            step()
+            time.sleep(0.001)
+        assert not scheduler.has_requests()
+        assert pool.get_num_free_blocks() == initial_free
+        assert len(terminal) == 1
+        assert terminal[0].failed_notifications == {request.request_id: 1}
+        assert not terminal[0].completed_notifications
+        assert "producer release was not confirmed" in caplog_vllm.text
+        if failure_stage == "handshake":
+            assert not handshake_succeeded.is_set()
+            assert sdk_events == [
+                ("handshake", "attempt"),
+                ("handshake", "failed", "Again", EAGAIN),
+            ]
+        else:
+            assert handshake_succeeded.is_set()
+            assert sdk_events == [
+                ("handshake", "attempt"),
+                ("handshake", "succeeded"),
+                ("notification", "attempt"),
+                (
+                    "notification",
+                    "failed",
+                    "RuntimeError",
+                    "Simulated send_notif failure",
+                ),
+            ]
+    finally:
+        release.set()
+        if started.is_set():
+            assert returned.wait(5)
+        connector.shutdown()
+        scheduler.get_kv_connector().shutdown()
+
+
+@pytest.mark.parametrize("same_step", [False, True])
+def test_cancel_notification_waits_for_all_worker_outcomes(
+    default_vllm_config, caplog_vllm, same_step
+):
+    """The public output boundary retains partial failure until both workers finish."""
+    from vllm.config import ParallelConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlConnectorWorkerMetadata,
+    )
+
+    config = create_vllm_config()
+    config.parallel_config = ParallelConfig(tensor_parallel_size=2)
+    scheduler = create_scheduler(config)
+    aggregator = KVOutputAggregator.from_connector(scheduler.get_kv_connector(), 2)
+    request = create_request(request_id=64, do_remote_prefill=True)
+    failed = NixlConnectorWorkerMetadata(failed_notifications={request.request_id: 1})
+    completed = NixlConnectorWorkerMetadata(
+        completed_notifications={request.request_id: 1}
+    )
+
+    def step(first, second):
+        assert scheduler.has_requests()
+        scheduled = scheduler.schedule()
+        assert scheduled.total_num_scheduled_tokens == 0
+        output = aggregator.aggregate(
+            [
+                create_model_runner_output([], kv_connector_worker_meta=first),
+                create_model_runner_output([], kv_connector_worker_meta=second),
+            ]
+        )
+        assert output is not None
+        results = output.kv_connector_output
+        assert results is not None
+        assert not results.finished_sending and not results.finished_recving
+        assert not results.failed_recving
+        scheduler.update_from_output(scheduled, output)
+
+    try:
+        pool = scheduler.kv_cache_manager.block_pool
+        initial_free = pool.get_num_free_blocks()
+        scheduler.add_request(request)
+        scheduler.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
+        step(failed, completed if same_step else None)
+        if not same_step:
+            assert scheduler.has_requests(), "A single worker must not finish cleanup"
+            assert "producer release was not confirmed" not in caplog_vllm.text
+            step(None, completed)
+        assert not scheduler.has_requests()
+        assert pool.get_num_free_blocks() == initial_free
+        assert "producer release was not confirmed" in caplog_vllm.text
+    finally:
+        scheduler.get_kv_connector().shutdown()
+
+
 @patch(
     "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
     FailingNixlWrapper,
@@ -4246,6 +4599,11 @@ def test_failed_request_skips_kv_postprocessing(
         patch.object(worker, "sync_recved_kv_to_device") as mock_sync,
         patch.object(worker, "post_process_device_kv_on_receive") as mock_postprocess,
     ):
+        if failure_mode == "transfer_exception":
+            pending = connector.get_transfer_results(finished_req_ids=set())
+            assert pending.finished_recving == pending.failed_recving == set()
+            assert connector.get_block_ids_with_load_errors() == set()
+            worker.nixl_wrapper.fail_transfer_exception = False
         results = connector.get_transfer_results(finished_req_ids=set())
 
     assert request_id in results.finished_recving
@@ -4307,6 +4665,25 @@ def test_recv_failure_waits_for_unpollable_handle_to_be_released(recv_worker):
     assert results.finished_recving == results.failed_recving == {"request"}
     assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
     assert worker.nixl_wrapper.release_xfer_handle.call_count == 2
+
+
+def test_recv_poll_exception_retires_successfully_cancelled_transfer(recv_worker):
+    """NIXL release cancels active transfers; successful release permits reuse."""
+    worker = recv_worker
+    worker._recving_transfers["request"] = [101]
+    worker._pending_recv_notifs = {"request": [("prefill", b"request:1")]}
+    worker.nixl_wrapper.check_xfer_state.side_effect = RuntimeError("poll")
+    worker.nixl_wrapper.release_xfer_handle.return_value = None
+
+    results = worker.get_transfer_results()
+    assert results.finished_recving == results.failed_recving == {"request"}
+    assert worker.get_block_ids_with_load_errors() == {1, 2, 3}
+    worker.nixl_wrapper.release_xfer_handle.assert_called_once_with(101)
+
+    results = worker.get_transfer_results()
+    assert results.finished_recving == results.failed_recving == set()
+    assert worker.get_block_ids_with_load_errors() == set()
+    worker.nixl_wrapper.send_notif.assert_not_called()
 
 
 def _set_test_speculative_config(
@@ -4477,6 +4854,7 @@ def test_scheduler_advertises_transfer_topology(
     [
         ("vllm_version", {}, {"vllm_version": "0.6.1"}, True, True),
         ("nixl_connector_version", {}, {"connector_version": 37}, True, True),
+        ("previous_connector_schema", {}, {"connector_version": 13}, True, True),
         ("model_name", {"model": "facebook/opt-350m"}, {}, True, True),
         ("dtype", {"dtype": "bfloat16"}, {}, True, True),
         ("cache_dtype", {"cache_dtype": "fp8"}, {}, True, True),

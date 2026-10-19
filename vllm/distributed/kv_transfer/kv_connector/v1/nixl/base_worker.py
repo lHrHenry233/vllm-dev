@@ -125,6 +125,18 @@ def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     return len(block_strides) == len(storage_ptrs) == 1
 
 
+def _tensor_byte_span_end(cache: torch.Tensor) -> int:
+    """Return the exclusive end address touched by a nonnegative-stride view."""
+    if cache.numel() == 0:
+        return cache.data_ptr()
+    if any(stride < 0 for stride in cache.stride()):
+        raise ValueError("NIXL cache views must have nonnegative strides")
+    max_element_offset = sum(
+        (size - 1) * stride for size, stride in zip(cache.shape, cache.stride())
+    )
+    return cache.data_ptr() + (max_element_offset + 1) * cache.element_size()
+
+
 class NixlBaseConnectorWorker:
     """Base implementation of Worker side methods shared by pull and push."""
 
@@ -872,6 +884,8 @@ class NixlBaseConnectorWorker:
         self.dst_region_group_ids: dict[EngineId, list[int]] = {}
         self.dst_uses_region_group_mapping: dict[EngineId, bool] = {}
         self.dst_region_mem_types: dict[EngineId, list[str]] = {}
+        self.dst_layer_group_ids: dict[EngineId, dict[str, int]] = {}
+        self.dst_region_indices: dict[EngineId, tuple[int, ...]] = {}
         self._registered_descs: list[Any] = []
         self._kv_unregistered = False
 
@@ -969,6 +983,8 @@ class NixlBaseConnectorWorker:
         # Page length of the PLE short-conv state; its region may be shared with
         # pages of a different (smaller) size, so it cannot use the region's.
         self._ple_block_len: int | None = None
+        self._ple_state_size: int | None = None
+        self._ple_block_stride: int | None = None
 
         # Enable different block lengths for different layers *only* when MLA is used.
         # This is not used for SSM layers, which use the counterpart `mamba_ssm_size`.
@@ -1499,10 +1515,13 @@ class NixlBaseConnectorWorker:
         registration_ranges: dict[tuple[int, str], tuple[int, int, int]] = {}
         region_mem_types: list[str] = []
         seen_base_addresses: list[int] = []
+        region_by_owner: dict[tuple[int, int | None, str | None], int] = {}
         self._ssm_region_indices = []
         self._scratch_region_indices = []
         self._ple_block_len = None
         self._ple_region_index = None
+        self._ple_state_size = None
+        self._ple_block_stride = None
 
         # A shared packed row may transfer whole only if every page in it is
         # replicated across TP ranks: MLA without SSM state. Head-sharded
@@ -1518,7 +1537,9 @@ class NixlBaseConnectorWorker:
         ):
             raise NotImplementedError("PP push with packed KV caches requires MLA")
 
-        track_region_layers = self._tracks_region_layers()
+        track_region_layers = self._tracks_region_layers() or (
+            self._is_csa_linear and self._has_mamba
+        )
         region_layers: list[list[str]] = []
         packed_member_layouts: dict[str, tuple[int, int]] = {}
 
@@ -1609,6 +1630,28 @@ class NixlBaseConnectorWorker:
                     # CSA-linear packs multiple cache owners in each block, so
                     # state views advance by the packed block stride.
                     block_stride = cache.stride(0) * cache.element_size()
+                if layer_spec.tp_replicated:
+                    state_size = layer_spec.real_page_size_bytes
+                    state_end = (
+                        cache.data_ptr()
+                        + (logical_num_blocks - 1) * block_stride
+                        + state_size
+                    )
+                    if (
+                        not 0 < state_size <= block_stride
+                        or logical_num_blocks <= 0
+                        or logical_num_blocks != self._logical_num_blocks
+                        or cache.data_ptr() < registration_base
+                        or state_end > _tensor_byte_span_end(cache)
+                        or state_end > registration_base + registration_len
+                        or (cache.ndim > 1 and not cache[0].is_contiguous())
+                    ):
+                        raise ValueError(
+                            "PLE state payload exceeds its cache view or "
+                            "registration geometry"
+                        )
+                    self._ple_state_size = state_size
+                    self._ple_block_stride = block_stride
                 assert block_stride % physical_ratio == 0
                 region_specs = [
                     (cache.data_ptr(), block_len, block_stride // physical_ratio)
@@ -1700,10 +1743,40 @@ class NixlBaseConnectorWorker:
                     ]
 
             for base_addr, block_len, block_stride in region_specs:
+                # Raw keys have their own cache group and payload, even when
+                # they alias a compressed or main KV page at the same address.
+                owner = (
+                    layer_name
+                    if self._is_csa_linear
+                    and self._has_mamba
+                    and isinstance(layer_spec, CircularBufferSpec)
+                    else None
+                )
+                if owner is not None:
+                    endpoint_end = (
+                        base_addr + (num_blocks - 1) * block_stride + block_len
+                    )
+                    if (
+                        not 0 < block_len <= block_stride
+                        or num_blocks <= 0
+                        or base_addr < registration_base
+                        or endpoint_end > _tensor_byte_span_end(cache)
+                        or endpoint_end > registration_base + registration_len
+                        or (cache.ndim > 1 and not cache[0].is_contiguous())
+                    ):
+                        raise ValueError(
+                            "Raw-key payload exceeds its cache view or "
+                            "registration geometry"
+                        )
+                region_key = (
+                    base_addr,
+                    group_id if self._is_csa_linear else None,
+                    owner,
+                )
                 # A packed PP producer keeps one region per layer, so aliases at
                 # one address (a layer and its SWA view) stay distinct.
-                if base_addr in seen_base_addresses and not route_packed_layers:
-                    region_index = seen_base_addresses.index(base_addr)
+                if region_key in region_by_owner and not route_packed_layers:
+                    region_index = region_by_owner[region_key]
                     assert region_mem_types[region_index] == mem_type
                     self._region_is_mla[region_index] |= is_mla_region
                     if is_mla_region:
@@ -1714,6 +1787,7 @@ class NixlBaseConnectorWorker:
                         self.region_group_ids[region_index] = _SHARED_REGION_GROUP_ID
                 else:
                     region_index = len(seen_base_addresses)
+                    region_by_owner[region_key] = region_index
                     seen_base_addresses.append(base_addr)
                     self.block_len_per_layer.append(block_len)
                     self.block_stride_per_layer.append(block_stride)
@@ -1782,9 +1856,6 @@ class NixlBaseConnectorWorker:
         self.region_mem_types = region_mem_types
         self._uses_region_group_mapping = len(set(self.region_group_ids)) > 1
         self._mixed_mem_types = len(set(region_mem_types)) > 1
-        if self._has_mamba:
-            self.region_num_blocks = [self.num_blocks] * self.num_regions
-
         self._set_region_layers(region_layers)
         self._packed_member_layouts = packed_member_layouts
 
@@ -1808,9 +1879,9 @@ class NixlBaseConnectorWorker:
         self._mixed_mem_types = len(set(region_mem_types)) > 1
         self._skip_dram_xfer = self._leaves_dram_xfer_to_rank0()
         if self._mixed_mem_types:
-            assert self.use_mla and not self._has_mamba, (
-                "Mixed-device KV registration is only supported for MLA "
-                "models without Mamba layers."
+            assert (self.use_mla and not self._has_mamba) or self._is_csa_linear, (
+                "Mixed-device KV registration requires pure MLA or "
+                "CSA-linear cache regions."
             )
         for mem_type in sorted(set(region_mem_types)):
             if mem_type == "DRAM" and self._skip_dram_xfer:
@@ -1883,6 +1954,12 @@ class NixlBaseConnectorWorker:
             pcp_size=self.pcp_size,
             region_members=self.region_members,
             packed_member_layouts=self._packed_member_layouts,
+            ple_state_size=self._ple_state_size,
+            layer_group_ids=(
+                self.kv_cache_config.transfer_group_index_by_layer
+                if self._is_csa_linear and self._has_mamba
+                else {}
+            ),
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1893,12 +1970,13 @@ class NixlBaseConnectorWorker:
         )
 
     def _ple_page_len(self) -> int:
-        """Transfer length of one PLE state page.
+        """Padded length of one PLE owner's state page.
 
         The PLE page shares its region with the first page of other cache
-        groups (block-outer layout), whose block_len may be smaller; the
-        descriptors must cover the whole PLE page or part of the conv state
-        never reaches the decode side."""
+        groups (block-outer layout), whose block_len may be smaller. Keep
+        this geometry distinct from the active payload copied by wire 16;
+        bounding that payload by another owner's page would truncate state.
+        """
         assert self._ple_region_index is not None
         assert self._ple_block_len is not None, (
             "PLE region registered without its page length"
@@ -1990,16 +2068,155 @@ class NixlBaseConnectorWorker:
             )
 
         if (region_index := self._ple_region_index) is not None:
-            block_len = self._ple_page_len() * physical_per_logical
+            assert self._ple_state_size is not None
+            block_len = self._ple_state_size
             block_stride = (
                 self.block_stride_per_layer[region_index] * physical_per_logical
             )
-            base_addr = base_addresses[region_index]
+            page_len = self._ple_page_len() * physical_per_logical
+            if not 0 < block_len <= page_len <= block_stride:
+                raise ValueError("PLE state payload exceeds its page geometry")
+            if block_stride != self._ple_block_stride:
+                raise ValueError("PLE state stride differs from its shared region")
             strided_descs.append(
-                (base_addr, block_len, device_id, block_stride, num_blocks)
+                (
+                    base_addresses[region_index],
+                    block_len,
+                    device_id,
+                    block_stride,
+                    num_blocks,
+                )
             )
 
         return self._pack_strided_descs(strided_descs)
+
+    def _remote_mamba_regions(
+        self, metadata: NixlAgentMetadata
+    ) -> tuple[list[int], int | None]:
+        region_indices = self._ssm_region_indices or list(
+            range(len(metadata.kv_caches_base_addr))
+        )
+        if not self._is_csa_linear:
+            return region_indices, self._ple_region_index
+
+        if len(metadata.region_members) != len(metadata.kv_caches_base_addr):
+            raise ValueError("CSA-linear state transfer requires remote region_members")
+        if self._ple_region_index is not None and (
+            metadata.ple_state_size is None
+            or metadata.ple_state_size != self._ple_state_size
+        ):
+            raise ValueError(
+                "PLE state payload sizes must match: "
+                f"local={self._ple_state_size}, remote={metadata.ple_state_size}"
+            )
+        remote_regions: dict[str, int] = {}
+        for index, names in enumerate(metadata.region_members):
+            for name in names:
+                if name in remote_regions:
+                    raise ValueError(f"Duplicate remote cache owner: {name}")
+                remote_regions[name] = index
+
+        def resolve(local_index: int, replicated: bool) -> int:
+            names = [
+                name
+                for name in self.region_members[local_index]
+                if isinstance(spec := self._layer_specs[name], MambaSpec)
+                and spec.tp_replicated == replicated
+            ]
+            missing = [name for name in names if name not in remote_regions]
+            if not names or missing:
+                raise ValueError(f"Missing remote state cache owners: {missing}")
+            regions = {remote_regions[name] for name in names}
+            if len(regions) != 1:
+                raise ValueError(
+                    f"CSA-linear state aliases must share one remote region: {names}"
+                )
+            return regions.pop()
+
+        ple_region = (
+            resolve(self._ple_region_index, True)
+            if self._ple_region_index is not None
+            else None
+        )
+        if ple_region is not None:
+            assert metadata.ple_state_size is not None
+            physical_ratio = metadata.physical_blocks_per_logical_kv_block
+            block_stride = metadata.block_strides[ple_region] * physical_ratio
+            if (
+                type(metadata.ple_block_len) is not int
+                or metadata.ple_block_len <= 0
+                or metadata.ple_block_len * physical_ratio
+                != self._ple_page_len() * self._physical_blocks_per_logical_kv_block
+            ):
+                raise ValueError("PLE pages require identical P/D geometry")
+            region_capacity = (
+                metadata.region_num_blocks[ple_region]
+                if metadata.region_num_blocks is not None
+                else metadata.num_blocks
+            )
+            if not (
+                0
+                < metadata.ple_state_size
+                <= metadata.ple_block_len * physical_ratio
+                <= block_stride
+            ):
+                raise ValueError("PLE state payload exceeds the remote block stride")
+            if (
+                physical_ratio <= 0
+                or metadata.num_blocks <= 0
+                or metadata.num_blocks % physical_ratio
+                or metadata.num_blocks > region_capacity
+            ):
+                raise ValueError("PLE state blocks exceed the remote region capacity")
+        return [resolve(index, False) for index in region_indices], ple_region
+
+    def _csa_remote_region_indices(
+        self, metadata: NixlAgentMetadata
+    ) -> tuple[int, ...]:
+        """Match transfer endpoints by attention owners, ignoring state aliases."""
+        owners = {name for names in self.region_members for name in names}
+        remote_owners = [name for names in metadata.region_members for name in names]
+        if set(remote_owners) != owners or len(remote_owners) != len(owners):
+            raise ValueError("CSA-linear transfer requires complete region_members")
+
+        def endpoint(names: list[str]) -> frozenset[str]:
+            attention = frozenset(
+                name
+                for name in names
+                if _is_attention_spec(type(self._layer_specs[name]))
+            )
+            return attention or frozenset(names)
+
+        remote_regions = {
+            endpoint(names): index
+            for index, names in enumerate(metadata.region_members)
+        }
+        if len(remote_regions) != len(metadata.region_members):
+            raise ValueError("CSA-linear transfer has ambiguous remote endpoints")
+        indices = []
+        for local, names in enumerate(self.region_members):
+            remote = remote_regions.get(endpoint(names))
+            if remote is None:
+                raise ValueError("CSA-linear transfer has incompatible cache endpoints")
+            if metadata.block_lens[remote] != self.block_len_per_layer[local]:
+                raise ValueError("CSA-linear cache endpoint payload sizes must match")
+            indices.append(remote)
+        if len(set(indices)) != len(metadata.region_members):
+            raise ValueError("CSA-linear transfer requires a cache endpoint bijection")
+        capacities = metadata.region_num_blocks or [metadata.num_blocks] * len(
+            metadata.region_members
+        )
+        if any(type(capacity) is not int or capacity <= 0 for capacity in capacities):
+            raise ValueError("CSA-linear cache endpoint capacities must be positive")
+        if self.dst_region_num_blocks[metadata.engine_id] != capacities:
+            raise ValueError(
+                "CSA-linear cache endpoint capacities differ across TP ranks"
+            )
+        indices_tuple = tuple(indices)
+        previous = self.dst_region_indices.get(metadata.engine_id)
+        if previous is not None and previous != indices_tuple:
+            raise ValueError("CSA-linear cache endpoints differ across TP ranks")
+        return indices_tuple
 
     def _build_mamba_remote(
         self,
@@ -2033,9 +2250,7 @@ class NixlBaseConnectorWorker:
         strided_descs: list[tuple[int, int, int, int, int]] = []
         # NOTE (ZhanqiuHu): use per-layer block_lens[i], not [0], in case
         # block lengths vary across layers (e.g. MLA).
-        region_indices = self._ssm_region_indices or range(
-            len(nixl_agent_meta.kv_caches_base_addr)
-        )
+        region_indices, ple_region_index = self._remote_mamba_regions(nixl_agent_meta)
         for i in region_indices:
             base_addr = nixl_agent_meta.kv_caches_base_addr[i]
             block_stride = (
@@ -2051,20 +2266,9 @@ class NixlBaseConnectorWorker:
                 (ssm_addr, ssm_read_size, device_id, block_stride, num_blocks)
             )
 
-        if (region_index := self._ple_region_index) is not None:
-            local_block_len = (
-                self._ple_page_len() * self._physical_blocks_per_logical_kv_block
-            )
-            # Same NIXL_CONNECTOR_VERSION on both sides, so the field is set.
-            assert nixl_agent_meta.ple_block_len is not None
-            remote_block_len = (
-                nixl_agent_meta.ple_block_len * remote_physical_per_logical
-            )
-            if local_block_len != remote_block_len:
-                raise ValueError(
-                    "PLE pages require identical P/D geometry: "
-                    f"local={local_block_len}, remote={remote_block_len}."
-                )
+        if (region_index := ple_region_index) is not None:
+            assert nixl_agent_meta.ple_state_size is not None
+            remote_block_len = nixl_agent_meta.ple_state_size
             remote_block_stride = (
                 nixl_agent_meta.block_strides[region_index]
                 * remote_physical_per_logical
@@ -2174,10 +2378,20 @@ class NixlBaseConnectorWorker:
         block_strides = nixl_agent_meta.block_strides
         strided_descs: list[tuple[int, int, int, int, int]] = []
         use_layer_name_routing = bool(self._transfer_layer_region_indices)
+        local_region_by_remote = {}
+        if self._is_csa_linear and self._has_mamba:
+            local_region_by_remote = {
+                remote: local
+                for local, remote in enumerate(
+                    self.dst_region_indices[nixl_agent_meta.engine_id]
+                )
+            }
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
             local_region = (
                 self._transfer_layer_region_indices[i] if use_layer_name_routing else i
             )
+            if local_region_by_remote:
+                local_region = local_region_by_remote[i]
             replicated = self._is_region_replicated(local_region)
             # Read our whole local region size from remote..
             local_block_len = self.block_len_per_layer[local_region]
@@ -2240,20 +2454,40 @@ class NixlBaseConnectorWorker:
             blocks_data = np.concatenate([blocks_data, mamba])
 
         if self._mixed_mem_types:
-            desc_is_dram = np.concatenate(
-                [
-                    np.full(
-                        count * block_size_ratio,
-                        mem_type == "DRAM",
-                        dtype=bool,
+            memory_masks = [
+                np.full(
+                    count * block_size_ratio,
+                    mem_type == "DRAM",
+                    dtype=bool,
+                )
+                for mem_type, count in zip(
+                    self.region_mem_types,
+                    self.region_num_blocks,
+                    strict=True,
+                )
+            ]
+            if self._has_mamba:
+                assert self._conv_decomp is not None
+                state_regions = len(self._conv_decomp.local_conv_offsets) + 1
+                for region in self._ssm_region_indices or range(
+                    len(local_base_addresses)
+                ):
+                    memory_masks.append(
+                        np.full(
+                            self._logical_num_blocks * state_regions,
+                            self.region_mem_types[region] == "DRAM",
+                            dtype=bool,
+                        )
                     )
-                    for mem_type, count in zip(
-                        self.region_mem_types,
-                        self.region_num_blocks,
-                        strict=True,
+                if (ple_region := self._ple_region_index) is not None:
+                    memory_masks.append(
+                        np.full(
+                            self._logical_num_blocks,
+                            self.region_mem_types[ple_region] == "DRAM",
+                            dtype=bool,
+                        )
                     )
-                ]
-            )
+            desc_is_dram = np.concatenate(memory_masks)
             assert len(desc_is_dram) == blocks_data[:, 4].sum()
             desc_pos = np.empty(len(desc_is_dram), dtype=np.int64)
             dram_idx = np.where(desc_is_dram)[0]
@@ -2526,6 +2760,8 @@ class NixlBaseConnectorWorker:
         self._validate_remote_agent_handshake(
             nixl_agent_meta, remote_tp_size, remote_dcp_size
         )
+        if self._is_csa_linear and self._has_mamba:
+            self.dst_layer_group_ids[engine_id] = nixl_agent_meta.layer_group_ids
 
         # This is 1 when P and D `--tensor-parallel-size` match. Otherwise,
         # this is the ratio between the two sizes.
@@ -2868,7 +3104,9 @@ class NixlBaseConnectorWorker:
         )
         if nixl_agent_meta.region_group_ids is not None:
             assert len(nixl_agent_meta.region_group_ids) == num_remote_regions
-        if nixl_agent_meta.region_names is not None:
+        if nixl_agent_meta.region_names is not None and not (
+            self._is_csa_linear and self._has_mamba
+        ):
             expected_names = (
                 list(self._transfer_layer_names)
                 if self._transfer_layer_names
@@ -2880,6 +3118,37 @@ class NixlBaseConnectorWorker:
             )
         if nixl_agent_meta.region_mem_types is not None:
             assert len(nixl_agent_meta.region_mem_types) == num_remote_regions
+        if self._is_csa_linear and self._has_mamba:
+            self._remote_mamba_regions(nixl_agent_meta)
+            if nixl_agent_meta.pcp_size != 1:
+                raise NotImplementedError("CSA-linear transfer requires remote PCP=1")
+            if tp_ratio != 1 or block_size_ratio != 1:
+                raise NotImplementedError(
+                    "CSA-linear cache endpoints require equal TP and block sizes"
+                )
+            groups = nixl_agent_meta.layer_group_ids
+            owners = {name for region in self.region_members for name in region}
+            if (
+                set(groups) != owners
+                or any(type(group) is not int or group < 0 for group in groups.values())
+                or set(groups.values())
+                != set(range(max(groups.values(), default=-1) + 1))
+            ):
+                raise ValueError(
+                    "CSA-linear transfer requires complete layer_group_ids"
+                )
+            region_indices = self._csa_remote_region_indices(nixl_agent_meta)
+            for region, names in enumerate(nixl_agent_meta.region_members):
+                if nixl_agent_meta.region_group_ids is not None:
+                    group = nixl_agent_meta.region_group_ids[region]
+                    if group >= 0 and any(groups[name] != group for name in names):
+                        raise ValueError(
+                            "CSA-linear layer_group_ids disagree with region"
+                        )
+            previous = self.dst_layer_group_ids.get(remote_engine_id)
+            if previous is not None and previous != groups:
+                raise ValueError("CSA-linear layer_group_ids differ across TP ranks")
+            self.dst_region_indices[remote_engine_id] = region_indices
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
         """Copy recved kv from host buffer to device."""
@@ -3665,6 +3934,7 @@ class NixlBaseConnectorWorker:
         prefill_block_ids: BlockIds,
         decode_physical_per_logical: int,
         prefill_physical_per_logical: int,
+        group_spec_types: tuple[type[KVCacheSpec], ...] | None = None,
     ) -> tuple[BlockIds, BlockIds]:
         """Trim block ID lists so only the uncomputed suffix is transferred.
 
@@ -3688,6 +3958,8 @@ class NixlBaseConnectorWorker:
         # Skip mamba groups — their blocks represent full state (conv+ssm),
         # not per-token data, so trimming would corrupt the transfer.
         prefill_block_ids = list(prefill_block_ids)
+        if group_spec_types is None:
+            group_spec_types = self._group_spec_types
         if not self._has_mamba:
             for i, prefill_group in enumerate(prefill_block_ids):
                 num_decode_blocks = len(decode_block_ids[i])
@@ -3713,7 +3985,7 @@ class NixlBaseConnectorWorker:
             for i, prefill_group in enumerate(prefill_block_ids):
                 num_decode_blocks = len(decode_block_ids[i])
                 num_prefill_blocks = len(prefill_group)
-                if _is_ssm_spec(self._group_spec_types[i]):
+                if _is_ssm_spec(group_spec_types[i]):
                     if num_decode_blocks == num_prefill_blocks:
                         continue
                     # Only state-bearing slots reach here, normally just one
@@ -3950,6 +4222,8 @@ class NixlBaseConnectorWorker:
         self.dst_region_group_ids.pop(engine_id, None)
         self.dst_uses_region_group_mapping.pop(engine_id, None)
         self.dst_region_mem_types.pop(engine_id, None)
+        self.dst_layer_group_ids.pop(engine_id, None)
+        self.dst_region_indices.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)
