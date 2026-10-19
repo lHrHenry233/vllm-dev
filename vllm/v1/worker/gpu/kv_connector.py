@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -54,6 +56,10 @@ class KVConnector:
 
     def set_disabled(self, disabled: bool) -> None:
         pass
+
+    @contextmanager
+    def disabled(self) -> Iterator[None]:
+        yield
 
     def reset_capture_state(self) -> None:
         pass
@@ -179,6 +185,17 @@ class ActiveKVConnector(KVConnector):
         # Ensure that layer-wise connector hooks aren't called when disabled.
         kv_transfer_state._KV_CONNECTOR_AGENT = None if disabled else self.kv_connector
         self._disabled = disabled
+
+    @contextmanager
+    def disabled(self) -> Iterator[None]:
+        was_disabled = self._disabled
+        connector_agent = kv_transfer_state._KV_CONNECTOR_AGENT
+        self.set_disabled(True)
+        try:
+            yield
+        finally:
+            self._disabled = was_disabled
+            kv_transfer_state._KV_CONNECTOR_AGENT = connector_agent
 
 
 NO_OP_KV_CONNECTOR = KVConnector()

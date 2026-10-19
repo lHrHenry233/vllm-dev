@@ -281,6 +281,7 @@ def _make_capture_runner(captured: bool) -> GPUModelRunner:
     runner.block_tables = None
     runner.attn_groups = None
     runner.kv_cache_config = None
+    runner.max_num_tokens = 2
     runner.use_aux_hidden_state_outputs = False
     runner.kv_connector = model_runner_module.NO_OP_KV_CONNECTOR
     return runner
@@ -341,6 +342,102 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("nested_warmup", [False, True])
+def test_capture_model_does_not_consume_hisparse_mirror_phase(
+    monkeypatch, fail, nested_warmup
+):
+    """Synthetic PIECEWISE rows must leave the real prefill mirror available."""
+    from functools import partial
+
+    from vllm.distributed.kv_transfer import kv_transfer_state
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
+        HiSparseConnectorWorker,
+    )
+    from vllm.v1.hisparse import runtime as runtime_module
+    from vllm.v1.hisparse.runtime import HiSparseCacheHandle
+    from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+
+    monkeypatch.setattr(kv_transfer_state, "_KV_CONNECTOR_AGENT", None)
+    runtime = SimpleNamespace(
+        is_group_leader=True, eager_host_mirror=True, begin_forward=Mock()
+    )
+    handle = HiSparseCacheHandle(runtime)
+    worker = HiSparseConnectorWorker.__new__(HiSparseConnectorWorker)
+    worker.cache_handles = [handle]
+    worker._per_layer_mirrored = set()
+    worker._submitted_mirror_layers = set()
+    worker._slot_mapping_staging = None
+    worker._layer_ready_events = (Mock(),)
+    worker._enqueue_row_dma = Mock()
+    handle.submit_layer_mirror = partial(worker._enqueue_layer_mirror, 0)
+    metadata = SimpleNamespace(
+        num_actual_tokens=2,
+        num_decode_tokens=0,
+        max_query_len=2,
+        num_reqs=1,
+        req_id_per_token=torch.zeros(2, dtype=torch.int32),
+        is_cudagraph_capture=False,
+    )
+    context = SimpleNamespace(cudagraph_runtime_mode=runtime_module.CUDAGraphMode.NONE)
+    monkeypatch.setattr(runtime_module, "get_forward_context", lambda: context)
+
+    def synthetic_forward(*args, **kwargs):
+        handle.prepare_group_for_batch(metadata)
+        handle.finish_kv_update()
+
+    def capture(*args, **kwargs):
+        for mode in (
+            runtime_module.CUDAGraphMode.NONE,
+            runtime_module.CUDAGraphMode.PIECEWISE,
+        ):
+            context.cudagraph_runtime_mode = mode
+            synthetic_forward()
+        if nested_warmup:
+            runner._dummy_run(2, skip_eplb=True)
+            synthetic_forward()
+            synthetic_forward()
+        if fail:
+            raise RuntimeError("capture failed")
+
+    runner = _make_capture_runner(captured=True)
+    connector = ActiveKVConnector.__new__(ActiveKVConnector)
+    connector.kv_connector = Mock()
+    connector._disabled = False
+    connector.set_disabled(False)
+    runner.kv_connector = connector
+    runner.cudagraph_manager.capture = capture
+    runner.max_num_reqs = 1
+    runner.is_first_pp_rank = True
+    runner.is_last_pp_rank = False
+    runner.eplb = SimpleNamespace(suppress=contextlib.nullcontext)
+    runner.maybe_dummy_run_with_lora = lambda *args, **kwargs: contextlib.nullcontext()
+    runner.execute_model = synthetic_forward
+    monkeypatch.setattr(
+        model_runner_module, "freeze_gc_for_cudagraph_capture", contextlib.nullcontext
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (1 << 30, 1 << 30)
+    )
+
+    if fail:
+        with pytest.raises(RuntimeError, match="capture failed"):
+            runner.capture_model(profile_only=True)
+    else:
+        runner.capture_model(profile_only=True)
+
+    worker._enqueue_row_dma.assert_not_called()
+    assert not worker._per_layer_mirrored
+    assert kv_transfer_state._KV_CONNECTOR_AGENT is connector.kv_connector
+    handle.finish_kv_update()
+    worker._enqueue_row_dma.assert_called_once_with(
+        (0,), ready_event=worker._layer_ready_events[0]
+    )
+    with pytest.raises(RuntimeError, match="HiSparse layer 0 mirrored twice"):
+        handle.finish_kv_update()
 
 
 @pytest.mark.parametrize("target_buffer", ["absent", "none", "tensor"])

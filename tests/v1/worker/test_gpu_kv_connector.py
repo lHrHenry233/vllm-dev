@@ -117,3 +117,61 @@ def test_deferred_finalize_collects_results_before_saving(
 
     connector.finalize_step()
     assert events == ["handle", "bind", "start", "results", "wait", "clear"]
+
+
+@pytest.mark.parametrize("already_disabled", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_disabled_scope_preserves_connector_state(monkeypatch, already_disabled, fail):
+    """Nested dummy work must restore layer hooks, including on failure."""
+    monkeypatch.setattr(
+        kv_connector_module.kv_transfer_state, "_KV_CONNECTOR_AGENT", None
+    )
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events)
+    connector.set_disabled(already_disabled)
+
+    def run():
+        with connector.disabled():
+            with connector.disabled():
+                connector.pre_forward(_scheduler_output(True))
+                assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is None
+            assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is None
+            if fail:
+                raise RuntimeError("dummy failed")
+
+    if fail:
+        with pytest.raises(RuntimeError, match="dummy failed"):
+            run()
+    else:
+        run()
+
+    assert events == []
+    expected = None if already_disabled else connector.kv_connector
+    assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is expected
+    connector.pre_forward(_scheduler_output(True))
+    assert events == ([] if already_disabled else ["handle", "bind", "start"])
+
+
+@pytest.mark.parametrize("entry_enabled", [False, True])
+def test_disabled_scope_preserves_global_state_across_wrappers(
+    monkeypatch, entry_enabled
+):
+    """A different wrapper must not re-enable hooks inside an outer scope."""
+    monkeypatch.setattr(
+        kv_connector_module.kv_transfer_state, "_KV_CONNECTOR_AGENT", None
+    )
+    connector = _make_connector(monkeypatch, [])
+    connector.set_disabled(False)
+    entry_agent = connector.kv_connector if entry_enabled else None
+    monkeypatch.setattr(
+        kv_connector_module.kv_transfer_state, "_KV_CONNECTOR_AGENT", entry_agent
+    )
+    inner = ActiveKVConnector.__new__(ActiveKVConnector)
+    inner.kv_connector = connector.kv_connector
+    inner._disabled = False
+
+    with connector.disabled():
+        with inner.disabled():
+            assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is None
+        assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is None
+    assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is entry_agent
