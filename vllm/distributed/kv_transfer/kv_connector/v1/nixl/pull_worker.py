@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
+    NixlConnectorWorkerMetadata,
     ReqMeta,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
@@ -21,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 )
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
+from vllm.v1.kv_cache_interface import MambaSpec
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -45,12 +47,46 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         super().__init__(vllm_config, engine_id, kv_cache_config)
         # Registration generation of each remote engine's loaded agent.
         self._remote_registration_generations: dict[EngineId, int] = {}
+        self._pending_notifications: dict[str, bool] = {}
+        self._notification_results: dict[str, bool] = {}
+
+    def _finish_notification(self, request_id: str, *, failed: bool = False) -> None:
+        if request_id in self._pending_notifications:
+            failed |= self._pending_notifications.pop(request_id)
+            self._notification_results[request_id] = failed
+
+    def take_notification_results(self) -> NixlConnectorWorkerMetadata | None:
+        if not self._notification_results:
+            return None
+        results, self._notification_results = self._notification_results, {}
+        return NixlConnectorWorkerMetadata(
+            completed_notifications={
+                r: 1 for r, failed in results.items() if not failed
+            },
+            failed_notifications={r: 1 for r, failed in results.items() if failed},
+        )
+
+    def _handle_failed_transfer(
+        self,
+        req_id: str,
+        handle: int | None,
+        failed_req_ids: set[str] | None = None,
+        record_failed_transfer: bool = True,
+    ) -> bool:
+        released = super()._handle_failed_transfer(
+            req_id, handle, failed_req_ids, record_failed_transfer
+        )
+        # The base worker drains background handshake failures on this thread.
+        self._finish_notification(req_id, failed=True)
+        return released
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
         """Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
         for req_id, meta in metadata.reqs_to_recv.items():
+            if not meta.awaiting_kvs and not any(meta.local_block_ids):
+                self._pending_notifications[req_id] = False
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids, self._physical_blocks_per_logical_kv_block
             )
@@ -192,6 +228,26 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
             # _read_blocks so its existing cache-hit notification path runs.
             read_specs = [
                 ReadSpec(remote_rank=rank, local_block_ids=[], remote_block_ids=[])
+                for rank in plan.all_source_ranks
+            ]
+        elif self._is_csa_linear and self._has_mamba:
+            if (
+                tp_ratio != 1
+                or dcp_active
+                or self.pp_size != 1
+                or meta.pp_size != 1
+                or self.pcp_size != 1
+                or self.block_size != remote_info.remote_block_size
+                or self._physical_blocks_per_logical_kv_block != 1
+                or remote_info.remote_physical_blocks_per_logical != 1
+                or self.enable_permute_local_kv
+            ):
+                raise NotImplementedError(
+                    "CSA-linear pulls require equal TP, PP/PCP/DCP=1 and "
+                    "matching unsplit physical block sizes and layouts"
+                )
+            read_specs = [
+                ReadSpec(rank, local_block_ids, meta.remote.block_ids)
                 for rank in plan.all_source_ranks
             ]
         elif local_region_groups != remote_region_groups:
@@ -397,6 +453,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                             remote_agent_name=agent,
                         )
                         self.xfer_stats.record_failed_notification()
+                        if req_id in self._pending_notifications:
+                            self._pending_notifications[req_id] = True
+
+        self._finish_notification(req_id)
 
     def _read_blocks(
         self,
@@ -468,6 +528,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     remote_agent_name=agent_name,
                 )
                 self.xfer_stats.record_failed_notification()
+                if request_id in self._pending_notifications:
+                    self._pending_notifications[request_id] = True
             # Report even on notification failure: the KV is already local, and
             # an unreported parked request would hold its blocks forever.
             # Notify-only recvs must stay unreported (scheduler asserts).
@@ -475,7 +537,8 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self._recving_transfers.setdefault(request_id, [])
             return True
 
-        if not read_spec.block_ids_by_region:
+        csa_hybrid = self._is_csa_linear and self._has_mamba
+        if not read_spec.block_ids_by_region and not csa_hybrid:
             assert (
                 len(remote_block_ids)
                 == len(local_block_ids)
@@ -498,40 +561,18 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
-            block_size_ratio=None,
-            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
-            region_num_blocks=(self.dst_region_num_blocks.get(dst_engine_id) or None),
-            region_group_ids=(
-                list(range(self.num_regions))
-                if read_spec.block_ids_by_region
-                else (self.dst_region_group_ids.get(dst_engine_id) or None)
-            ),
-            uses_region_group_mapping=(
-                self.num_regions > 1
-                if read_spec.block_ids_by_region
-                else self.dst_uses_region_group_mapping[dst_engine_id]
-            ),
-        )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-            region_num_blocks=(self.dst_region_num_blocks.get(self.engine_id) or None),
-            region_group_ids=(
-                list(range(self.num_regions))
-                if read_spec.block_ids_by_region
-                else (self.region_group_ids or None)
-            ),
-            uses_region_group_mapping=(
-                self.num_regions > 1
-                if read_spec.block_ids_by_region
-                else self._uses_region_group_mapping
-            ),
-        )
+        if csa_hybrid:
+            local_block_descs_ids, remote_block_descs_ids = self._csa_read_desc_ids(
+                local_block_ids, remote_block_ids, dst_engine_id
+            )
+        else:
+            local_block_descs_ids, remote_block_descs_ids = self._read_desc_ids(
+                read_spec,
+                local_block_ids,
+                remote_block_ids,
+                dst_engine_id,
+                block_size_ratio,
+            )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
 
@@ -581,6 +622,161 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 assert handle is not None
                 self._recving_transfers[request_id].append(handle)
             return False
+
+    def _read_desc_ids(
+        self,
+        read_spec: ReadSpec,
+        local_block_ids: BlockIds,
+        remote_block_ids: BlockIds,
+        dst_engine_id: str,
+        block_size_ratio: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        assert self.transfer_topo is not None
+        remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
+        remote_block_descs_ids = self._compute_desc_ids(
+            block_ids=remote_block_ids,
+            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+            block_size_ratio=None,
+            physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
+            region_num_blocks=(self.dst_region_num_blocks.get(dst_engine_id) or None),
+            region_group_ids=(
+                list(range(self.num_regions))
+                if read_spec.block_ids_by_region
+                else (self.dst_region_group_ids.get(dst_engine_id) or None)
+            ),
+            uses_region_group_mapping=(
+                self.num_regions > 1
+                if read_spec.block_ids_by_region
+                else self.dst_uses_region_group_mapping[dst_engine_id]
+            ),
+        )
+        local_block_descs_ids = self._compute_desc_ids(
+            block_ids=local_block_ids,
+            dst_num_blocks=self.dst_num_blocks[self.engine_id],
+            block_size_ratio=block_size_ratio,
+            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+            region_num_blocks=(self.dst_region_num_blocks.get(self.engine_id) or None),
+            region_group_ids=(
+                list(range(self.num_regions))
+                if read_spec.block_ids_by_region
+                else (self.region_group_ids or None)
+            ),
+            uses_region_group_mapping=(
+                self.num_regions > 1
+                if read_spec.block_ids_by_region
+                else self._uses_region_group_mapping
+            ),
+        )
+        return local_block_descs_ids, remote_block_descs_ids
+
+    def _csa_read_desc_ids(
+        self,
+        local_blocks: BlockIds,
+        remote_blocks: BlockIds,
+        engine_id: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Pair each cache owner's blocks in the two native descriptor lists."""
+        local_groups = self.kv_cache_config.transfer_group_index_by_layer
+        remote_groups = self.dst_layer_group_ids[engine_id]
+        if (
+            len(local_blocks) != len(self.kv_cache_config.transfer_groups)
+            or len(remote_blocks) != max(remote_groups.values()) + 1
+        ):
+            raise ValueError("CSA-linear request block lists do not match cache groups")
+        local_ids: list[int] = []
+        remote_ids: list[int] = []
+
+        def append_region(
+            names: list[str],
+            local_offset: int,
+            remote_offset: int,
+            local_capacity: int,
+            remote_capacity: int,
+        ) -> None:
+            group_pairs: set[tuple[int, int]] = set()
+            for name in names:
+                pair = (local_groups[name], remote_groups[name])
+                if pair in group_pairs:
+                    continue
+                group_pairs.add(pair)
+                local = local_blocks[pair[0]]
+                remote = remote_blocks[pair[1]]
+                if any(block < 0 or block >= local_capacity for block in local) or any(
+                    block < 0 or block >= remote_capacity for block in remote
+                ):
+                    raise ValueError("CSA-linear block ID exceeds its cache capacity")
+                if not local:
+                    continue
+                trimmed_local, trimmed_remote = self._apply_prefix_caching(
+                    (local,),
+                    (remote,),
+                    1,
+                    1,
+                    group_spec_types=(type(self._layer_specs[name]),),
+                )
+                local_ids.extend(local_offset + block for block in trimmed_local[0])
+                remote_ids.extend(remote_offset + block for block in trimmed_remote[0])
+
+        local_capacities = self.region_num_blocks
+        remote_capacities = self.dst_region_num_blocks[engine_id]
+        remote_offsets = np.cumsum([0, *remote_capacities], dtype=np.int64)
+        local_offset = 0
+        for names, local_capacity, remote_region in zip(
+            self.region_members,
+            local_capacities,
+            self.dst_region_indices[engine_id],
+            strict=True,
+        ):
+            append_region(
+                [
+                    name
+                    for name in names
+                    if _is_attention_spec(type(self._layer_specs[name]))
+                ],
+                local_offset,
+                int(remote_offsets[remote_region]),
+                local_capacity,
+                remote_capacities[remote_region],
+            )
+            local_offset += local_capacity
+        remote_offset = int(remote_offsets[-1])
+
+        assert self._conv_decomp is not None
+        local_capacity = self._logical_num_blocks
+        remote_capacity = self.dst_num_blocks[engine_id]
+        for region in self._ssm_region_indices:
+            names = [
+                name
+                for name in self.region_members[region]
+                if isinstance(spec := self._layer_specs[name], MambaSpec)
+                and not spec.tp_replicated
+            ]
+            for _ in range(len(self._conv_decomp.local_conv_offsets) + 1):
+                append_region(
+                    names,
+                    local_offset,
+                    remote_offset,
+                    local_capacity,
+                    remote_capacity,
+                )
+                local_offset += local_capacity
+                remote_offset += remote_capacity
+        if self._ple_region_index is not None:
+            names = [
+                name
+                for name in self.region_members[self._ple_region_index]
+                if isinstance(spec := self._layer_specs[name], MambaSpec)
+                and spec.tp_replicated
+            ]
+            append_region(
+                names, local_offset, remote_offset, local_capacity, remote_capacity
+            )
+        if len(local_ids) != len(set(local_ids)):
+            raise ValueError("CSA-linear READ selected a destination descriptor twice")
+        return (
+            np.asarray(local_ids, dtype=np.int64),
+            np.asarray(remote_ids, dtype=np.int64),
+        )
 
     def _read_blocks_mixed(
         self,

@@ -37,6 +37,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlConnectorMetadata,
+    NixlConnectorWorkerMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.pull_scheduler import (
     NixlPullConnectorScheduler,
@@ -158,6 +159,9 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
             # return None when we have mla
             # as the layout should not matter in that case,
             # which fallback to the default behavior.
+            return None
+        if vllm_config.attention_config.hisparse_config is not None:
+            # HiSparse and the backend resolver select the required token-row layout.
             return None
         logger.info_once(
             "NixlConnector setting KV cache layout to LBHNC for "
@@ -386,6 +390,10 @@ class NixlPullConnector(NixlBaseConnector):
         assert isinstance(self.connector_worker, NixlPullConnectorWorker)
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
+
+    def build_connector_worker_meta(self) -> NixlConnectorWorkerMetadata | None:
+        assert isinstance(self.connector_worker, NixlPullConnectorWorker)
+        return self.connector_worker.take_notification_results()
 
 
 class NixlPushConnector(NixlBaseConnector):

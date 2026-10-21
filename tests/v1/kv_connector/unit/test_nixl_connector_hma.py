@@ -68,6 +68,9 @@ def region_pull_worker():
     worker._invalid_remote_engines = set()
     worker._remote_registration_generations = {}
     worker.use_mla, worker._has_mamba = True, False
+    worker._is_csa_linear = False
+    worker._pending_notifications = {}
+    worker._notification_results = {}
     worker.dcp_size = 1
     worker.dcp_rank = 0
     spec = MLAAttentionSpec(
@@ -380,6 +383,7 @@ def test_update_state_after_alloc_tracks_cached_blocks_per_group():
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
     scheduler = object.__new__(NixlPullConnectorScheduler)
+    scheduler._reqs_recving = set()
     scheduler._reqs_in_batch = set()
     scheduler._reqs_need_save = {}
     scheduler._reqs_need_recv = {}
@@ -708,6 +712,9 @@ def test_read_blocks_for_req_expands_remote_ids(
     worker.dcp_rank = 0
     worker._group_spec_types = resolved_types
     worker._has_mamba = any(t is MambaSpec for t in resolved_types)
+    worker._is_csa_linear = False
+    worker._pending_notifications = {}
+    worker._notification_results = {}
 
     has_mamba = any(t is MambaSpec for t in resolved_types)
     has_swa = any(t is SlidingWindowSpec for t in resolved_types)

@@ -10,6 +10,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds, EngineId
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
 )
 from vllm.logger import init_logger
 
@@ -17,6 +18,27 @@ logger = init_logger(__name__)
 
 TransferHandle = int
 ReqId = str
+
+
+@dataclass
+class NixlConnectorWorkerMetadata(KVConnectorWorkerMetadata):
+    """Notify-only work completed on each worker, independently of receives."""
+
+    completed_notifications: dict[ReqId, int] = field(default_factory=dict)
+    failed_notifications: dict[ReqId, int] = field(default_factory=dict)
+
+    def aggregate(
+        self, other: KVConnectorWorkerMetadata
+    ) -> "NixlConnectorWorkerMetadata":
+        assert isinstance(other, NixlConnectorWorkerMetadata)
+        completed = self.completed_notifications.copy()
+        failed = self.failed_notifications.copy()
+        for request_id, count in other.completed_notifications.items():
+            completed[request_id] = completed.get(request_id, 0) + count
+        for request_id, count in other.failed_notifications.items():
+            failed[request_id] = failed.get(request_id, 0) + count
+        return NixlConnectorWorkerMetadata(completed, failed)
+
 
 GET_META_MSG = b"get_meta_msg"
 
@@ -51,8 +73,11 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #  13: Add packed-member layouts and order-independent packed-push backend hashes
 #  14: Add Qwen3.8-Flash-Next PLE page length - #59997
 #  15: Add remote_registration_generation to kv_transfer_params
+#  16: Require CSA-linear owner mappings and active PLE payload geometry
 #
-NIXL_CONNECTOR_VERSION: int = 15
+NIXL_CONNECTOR_VERSION: int = 16
+# CSA-linear transfers active PLE bytes and requires semantic owner mappings.
+CSA_LINEAR_TRANSFER_PROTOCOL_VERSION: int = 1
 
 
 @dataclass
@@ -81,6 +106,10 @@ class NixlAgentMetadata:
     region_members: list[list[str]] = field(default_factory=list)
     # Packed member -> (byte offset in its region's block, bytes per page).
     packed_member_layouts: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # Replicated PLE conv payload bytes, excluding allocator page padding.
+    ple_state_size: int | None = None
+    # Semantic transfer-group indices, including owners sharing a region.
+    layer_group_ids: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -154,7 +183,7 @@ def compute_nixl_compatibility_hash(
     successfully transfer KV cache data.
 
     Factors included:
-    - vLLM version and NIXL connector version
+    - vLLM version, NIXL connector version, and CSA-linear transfer semantics
     - Model architecture (name, dtype, KV heads, layers)
     - KV cache format (dtype, sliding window)
     - Attention backend
@@ -187,6 +216,7 @@ def compute_nixl_compatibility_hash(
         # Version compatibility
         "vllm_version": vllm_version,
         "nixl_connector_version": NIXL_CONNECTOR_VERSION,
+        "csa_linear_transfer_protocol_version": CSA_LINEAR_TRANSFER_PROTOCOL_VERSION,
         # Model architecture - affects KV cache shape
         "model": model_config.model,
         "dtype": str(model_config.dtype),
