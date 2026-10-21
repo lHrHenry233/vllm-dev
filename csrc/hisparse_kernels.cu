@@ -318,25 +318,30 @@ __global__ __launch_bounds__(1024) void hisparse_resolve_residency_kernel(
     const int64_t resident_bt_stride, const int32_t resident_num_reqs,
     const int32_t resident_num_blocks, const int32_t resident_block_size,
     const int32_t resident_null_block, const int64_t input_row_stride,
-    const int64_t attention_row_stride, const int64_t valid_count_stride) {
+    const int64_t attention_row_stride, const int64_t valid_count_stride,
+    const int32_t* __restrict__ num_valid_rows) {
   const int NUM_WARPS = blockDim.x / kWarpSize;
   const int num_buffer_chunks = (hot_size + kWarpSize - 1) / kWarpSize;
 
-  // The first row of each contiguous run of a request's rows leads it. FULL
-  // CUDA-graph padding rows map to request 0 after the real rows, forming a
-  // second run, but carry no valid top-k: that run returns before phase 2
-  // touches the request's shared state.
+  // Padding belongs to no request, even when its input ids map to request 0.
+  const int valid_rows = num_valid_rows != nullptr
+                             ? min(*num_valid_rows, static_cast<int>(gridDim.x))
+                             : static_cast<int>(gridDim.x);
+  const auto request_of = [&](const int row) -> int32_t {
+    if (request_ids == nullptr) return row;
+    return row < valid_rows ? request_ids[row] : -1;
+  };
+  // The first row of each contiguous run of a request's rows leads it.
   const int first_row = blockIdx.x;
-  const int request_row =
-      request_ids != nullptr ? request_ids[first_row] : first_row;
+  const int request_row = request_of(first_row);
   if (request_ids != nullptr && first_row > 0 &&
-      request_ids[first_row - 1] == request_row) {
+      request_of(first_row - 1) == request_row) {
     return;
   }
   int end_row = first_row + 1;
   if (request_ids != nullptr) {
     while (end_row < static_cast<int>(gridDim.x) &&
-           request_ids[end_row] == request_row) {
+           request_of(end_row) == request_row) {
       ++end_row;
     }
   }
@@ -848,6 +853,43 @@ __global__ void hisparse_gather_compact_kernel(
   }
 }
 
+// Batch invalidation and padding request masking adapted from MatthewBonanni,
+// vLLM PR #60103, head 497cbba9079201bd3af6060dd8f8882f21fda0fe.
+__global__ void hisparse_invalidate_written_slots_batch_kernel(
+    int32_t* const* __restrict__ tables,
+    const int32_t* __restrict__ request_state_indices,
+    const int32_t* __restrict__ req_id_per_token,
+    const int64_t* __restrict__ written_slots, int64_t num_request_ids,
+    int64_t num_state_rows, int64_t region_stride) {
+  const int64_t token_idx = blockIdx.x;
+  const int32_t req_idx = req_id_per_token[token_idx];
+  if (req_idx < 0 || req_idx >= num_request_ids) return;
+  const int32_t state_idx = request_state_indices[req_idx];
+  const int64_t written_slot = written_slots[token_idx];
+  if (state_idx < 0 || state_idx >= num_state_rows || written_slot < 0 ||
+      written_slot > INT32_MAX)
+    return;
+  const int32_t slot = static_cast<int32_t>(written_slot);
+  int32_t* row =
+      tables[blockIdx.y] + static_cast<int64_t>(state_idx) * region_stride;
+  if (region_stride % 4 == 0 && (reinterpret_cast<uintptr_t>(row) & 15) == 0) {
+    const int4* row4 = reinterpret_cast<int4*>(row);
+    for (int64_t offset = threadIdx.x; offset < region_stride / 4;
+         offset += blockDim.x) {
+      const int4 value = row4[offset];
+      if (value.x == slot) row[4 * offset] = -1;
+      if (value.y == slot) row[4 * offset + 1] = -1;
+      if (value.z == slot) row[4 * offset + 2] = -1;
+      if (value.w == slot) row[4 * offset + 3] = -1;
+    }
+    return;
+  }
+  for (int64_t offset = threadIdx.x; offset < region_stride;
+       offset += blockDim.x) {
+    if (row[offset] == slot) row[offset] = -1;
+  }
+}
+
 __global__ void hisparse_invalidate_written_slots_kernel(
     int32_t* __restrict__ device_global_indices,
     const int32_t* __restrict__ request_state_indices,
@@ -951,6 +993,61 @@ void hisparse_invalidate_written_slots(
                   cudaGetErrorString(launch_error));
 }
 
+void hisparse_invalidate_written_slots_batch(
+    torch::stable::Tensor const& table_ptrs,
+    torch::stable::Tensor const& request_state_indices,
+    torch::stable::Tensor const& req_id_per_token,
+    torch::stable::Tensor const& written_slots, int64_t num_state_rows,
+    int64_t region_stride, int64_t threads) {
+  using torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(table_ptrs.is_cuda() && request_state_indices.is_cuda() &&
+                      req_id_per_token.is_cuda() && written_slots.is_cuda(),
+                  "HiSparse batch invalidation requires CUDA tensors");
+  STD_TORCH_CHECK(table_ptrs.scalar_type() == ScalarType::Long &&
+                      table_ptrs.dim() == 1 && table_ptrs.is_contiguous(),
+                  "table_ptrs must be contiguous 1D int64");
+  STD_TORCH_CHECK(request_state_indices.scalar_type() == ScalarType::Int &&
+                      request_state_indices.dim() == 1 &&
+                      request_state_indices.is_contiguous(),
+                  "request_state_indices must be contiguous 1D int32");
+  STD_TORCH_CHECK(req_id_per_token.scalar_type() == ScalarType::Int &&
+                      req_id_per_token.dim() == 1 &&
+                      req_id_per_token.is_contiguous(),
+                  "req_id_per_token must be contiguous 1D int32");
+  STD_TORCH_CHECK(written_slots.scalar_type() == ScalarType::Long &&
+                      written_slots.dim() == 1 && written_slots.is_contiguous(),
+                  "written_slots must be contiguous 1D int64");
+  STD_TORCH_CHECK(req_id_per_token.numel() == written_slots.numel(),
+                  "req_ids and written_slots must have equal length");
+  const int device = table_ptrs.get_device_index();
+  STD_TORCH_CHECK(request_state_indices.get_device_index() == device &&
+                      req_id_per_token.get_device_index() == device &&
+                      written_slots.get_device_index() == device,
+                  "HiSparse batch tensors must share one CUDA device");
+  STD_TORCH_CHECK(num_state_rows >= 0 && region_stride >= 0,
+                  "HiSparse batch layout dimensions must be nonnegative");
+  STD_TORCH_CHECK(threads == 256 || threads == 1024,
+                  "HiSparse batch threads must be 256 or 1024");
+  const int64_t tokens = written_slots.numel();
+  const int64_t groups = table_ptrs.numel();
+  if (!tokens || !groups || !num_state_rows || !region_stride) return;
+  STD_TORCH_CHECK(tokens <= INT32_MAX && groups <= 65535,
+                  "HiSparse batch grid exceeds CUDA limits");
+  const torch::stable::accelerator::DeviceGuard guard(device);
+  const dim3 grid(static_cast<unsigned int>(tokens),
+                  static_cast<unsigned int>(groups));
+  hisparse_invalidate_written_slots_batch_kernel<<<
+      grid, static_cast<unsigned int>(threads), 0, get_current_cuda_stream()>>>(
+      static_cast<int32_t* const*>(table_ptrs.const_data_ptr()),
+      request_state_indices.const_data_ptr<int32_t>(),
+      req_id_per_token.const_data_ptr<int32_t>(),
+      written_slots.const_data_ptr<int64_t>(), request_state_indices.numel(),
+      num_state_rows, region_stride);
+  const cudaError_t error = cudaGetLastError();
+  STD_TORCH_CHECK(error == cudaSuccess,
+                  "HiSparse batch launch failed: ", cudaGetErrorString(error));
+}
+
 void hisparse_resolve_residency(
     torch::stable::Tensor const& host_cache, torch::stable::Tensor& hot_cache,
     torch::stable::Tensor const& hot_block_table,
@@ -973,7 +1070,8 @@ void hisparse_resolve_residency(
     std::optional<torch::stable::Tensor> const& swap_device_physical_rows,
     std::optional<torch::stable::Tensor> const& swap_counts,
     std::optional<torch::stable::Tensor> const& resident_block_table,
-    int64_t resident_block_size, int64_t resident_null_block) {
+    int64_t resident_block_size, int64_t resident_null_block,
+    std::optional<torch::stable::Tensor> const& num_valid_rows) {
   STD_TORCH_CHECK(
       host_cache.device().is_cpu() && is_pinned_cpu_tensor(host_cache),
       "host_cache must be pinned CPU memory");
@@ -1066,6 +1164,20 @@ void hisparse_resolve_residency(
     source_bt_stride = table.stride(0);
     source_num_reqs = static_cast<int32_t>(table.size(0));
     source_num_blocks = static_cast<int32_t>(table.size(1));
+  }
+  const int32_t* num_valid_rows_ptr = nullptr;
+  if (num_valid_rows.has_value()) {
+    auto const& valid_rows = num_valid_rows.value();
+    STD_TORCH_CHECK(request_ids.has_value(),
+                    "num_valid_rows requires request_ids");
+    STD_TORCH_CHECK(
+        valid_rows.is_cuda() &&
+            valid_rows.get_device_index() == hot_cache.get_device_index() &&
+            valid_rows.scalar_type() == torch::headeronly::ScalarType::Int &&
+            valid_rows.numel() == 1 && valid_rows.is_contiguous(),
+        "num_valid_rows must be a one-element int32 tensor on the hot-cache "
+        "CUDA device");
+    num_valid_rows_ptr = valid_rows.const_data_ptr<int32_t>();
   }
   const int32_t required_hot_rows =
       request_ids_ptr != nullptr ? source_num_reqs : launch_rows;
@@ -1266,7 +1378,7 @@ void hisparse_resolve_residency(
       resident_num_reqs, resident_num_blocks,
       static_cast<int32_t>(resident_block_size),
       static_cast<int32_t>(resident_null_block), global_indices.stride(0),
-      attention_row_stride, valid_count_stride);
+      attention_row_stride, valid_count_stride, num_valid_rows_ptr);
   const cudaError_t launch_error = cudaGetLastError();
   STD_TORCH_CHECK(launch_error == cudaSuccess,
                   "HiSparse residency kernel launch failed: ",

@@ -1039,7 +1039,14 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                 Tensor(h!)? swap_counts=None,"
       "                 Tensor? resident_block_table=None,"
       "                 int resident_block_size=0,"
-      "                 int resident_null_block=0) -> ()");
+      "                 int resident_null_block=0,"
+      "                 Tensor? num_valid_rows=None) -> ()");
+
+  ops.def(
+      "hisparse_invalidate_written_slots_batch(Tensor table_ptrs,"
+      "                 Tensor request_state_indices, Tensor req_id_per_token,"
+      "                 Tensor written_slots, int num_state_rows,"
+      "                 int region_stride, int threads=256) -> ()");
 
   ops.def(
       "hisparse_invalidate_written_slots(Tensor! device_global_indices,"
@@ -1175,6 +1182,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
 #ifndef USE_ROCM
   ops.impl("hisparse_resolve_residency",
            TORCH_BOX(&hisparse_resolve_residency));
+  ops.impl("hisparse_invalidate_written_slots_batch",
+           TORCH_BOX(&hisparse_invalidate_written_slots_batch));
   ops.impl("hisparse_invalidate_written_slots",
            TORCH_BOX(&hisparse_invalidate_written_slots));
   ops.impl("hisparse_gather_plan", TORCH_BOX(&hisparse_gather_plan));
