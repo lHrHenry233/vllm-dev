@@ -558,6 +558,7 @@ def make_nixl_scheduler(
     )
 
     sched = object.__new__(NixlConnectorScheduler)
+    sched._reqs_recving = set()
     sched._has_mamba = has_mamba
     sched._bounded_replay = bounded_replay
     sched._is_hma_required = is_hma_required

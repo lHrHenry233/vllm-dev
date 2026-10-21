@@ -52,9 +52,15 @@ class _RecordingNixl:
         self.dlists: dict[int, np.ndarray] = {}
         self.xfers: list[tuple] = []
         self.registered: list[tuple[list[tuple], object]] = []
+        self.registration_requests: list[tuple[list[tuple], str]] = []
+        self.transfer_descriptor_requests: list[tuple[np.ndarray, str]] = []
+        self.started: set[int] = set()
+        self.checked: set[int] = set()
+        self.prepared: set[int] = set()
         self._next_handle = 1
 
     def get_reg_descs(self, caches_data, mem_type):
+        self.registration_requests.append((list(caches_data), mem_type))
         return caches_data
 
     def register_memory(self, descs, backends=None):
@@ -72,8 +78,12 @@ class _RecordingNixl:
     def prep_xfer_dlist(self, agent, descs, mem_type=None):
         handle = self._next_handle
         self._next_handle += 1
-        # Store per-block (addr, len, dev) rows so desc ids index directly.
-        self.dlists[handle] = expand_strided_descs(np.asarray(descs, dtype=np.uint64))
+        # NIXL indexes blocks in each strided run as consecutive flat ids.
+        rows = np.asarray(descs, dtype=np.uint64)
+        assert rows.ndim == 2 and rows.shape[1] == 5
+        expanded = expand_strided_descs(rows)
+        self.transfer_descriptor_requests.append((expanded.copy(), mem_type))
+        self.dlists[handle] = expanded
         return handle
 
     def add_remote_agent(self, metadata):
@@ -84,6 +94,7 @@ class _RecordingNixl:
     ):
         handle = self._next_handle
         self._next_handle += 1
+        self.prepared.add(handle)
         self.xfers.append(
             (
                 op,
@@ -96,9 +107,13 @@ class _RecordingNixl:
         return handle
 
     def transfer(self, handle):
-        pass
+        assert handle in self.prepared
+        assert handle not in self.started
+        self.started.add(handle)
 
     def check_xfer_state(self, handle):
+        assert handle in self.started, "completion checked before native transfer start"
+        self.checked.add(handle)
         return "DONE"
 
     def get_xfer_telemetry(self, handle):
@@ -160,6 +175,7 @@ def _make_packed_mla_view_worker(
     config = create_vllm_config(block_size=block_size)
     config.parallel_config.pipeline_parallel_size = pp_size
     config.kv_transfer_config.kv_role = "kv_producer"
+    config.kv_transfer_config.kv_buffer_device = "cuda"
     config.cache_config.kv_cache_layout = "BLHNC"
     backends = []
     for name in backend_names:
@@ -168,7 +184,11 @@ def _make_packed_mla_view_worker(
         backend.get_name.return_value = name
         backend.full_cls_name.return_value = f"fake.{name}"
         backends.append(backend)
+    fake_platform = MagicMock()
+    fake_platform.device_type = "cuda"
+    fake_platform.get_nixl_memory_type.return_value = "VRAM"
     with (
+        patch.object(bw, "current_platform", fake_platform),
         patch.object(bw, "NixlWrapper", _RecordingNixl),
         patch.object(bw, "get_tensor_model_parallel_rank", return_value=0),
         patch.object(bw, "get_tensor_model_parallel_world_size", return_value=1),
@@ -259,6 +279,41 @@ def test_packed_push_compatibility_hash_uses_all_backends_in_stable_order(
         {"L0": (0, 128)}, 128, backend_names=remote_backends
     )
     assert (producer.compat_hash == consumer.compat_hash) is compatible
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("peer_version,peer_semantics", [(14, 1), (15, 1), (16, 0)])
+def test_csa_linear_handshake_rejects_prior_protocol_before_agent_decode(
+    monkeypatch, peer_version, peer_semantics
+):
+    """Incompatible metadata must fail before decoding or registering its agent."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import metadata
+
+    worker, _ = _make_packed_mla_view_worker({"L0": (0, 128)}, 128)
+    with monkeypatch.context() as peer:
+        peer.setattr(metadata, "NIXL_CONNECTOR_VERSION", peer_version)
+        peer.setattr(metadata, "CSA_LINEAR_TRANSFER_PROTOCOL_VERSION", peer_semantics)
+        legacy = metadata.compute_nixl_compatibility_hash(
+            worker.vllm_config, worker.backend_name, transfer_mode="push"
+        )
+    assert worker.compat_hash != legacy
+    payload = metadata.NixlHandshakePayload(
+        compatibility_hash=legacy, agent_metadata_bytes=b"invalid-agent-metadata"
+    )
+    socket = MagicMock()
+    socket.recv_multipart.return_value = [
+        msgspec.msgpack.encode(payload),
+        msgspec.msgpack.encode(0.0),
+    ]
+    with (
+        patch.object(bw.current_platform, "set_device"),
+        patch.object(bw, "zmq_ctx") as context,
+        patch.object(worker, "add_remote_agent") as add_remote,
+    ):
+        context.return_value.__enter__.return_value = socket
+        with pytest.raises(RuntimeError, match="compatibility hash mismatch"):
+            worker._nixl_handshake("unused-local-peer", 1234, 1, "unused-engine")
+        add_remote.assert_not_called()
 
 
 @pytest.mark.cpu_test
@@ -437,6 +492,7 @@ def _register_overlaid_mla_worker(
     worker.dst_region_group_ids = {}
     worker.dst_uses_region_group_mapping = {}
     worker.dst_region_mem_types = {}
+    worker.dst_layer_group_ids = {}
     worker._desc_is_dram_by_block_size = {}
     worker._desc_pos_by_block_size = {}
     worker._dram_src_handles_by_block_size = {}
@@ -631,6 +687,7 @@ def _make_mla_hybrid_worker(
     )
 
     vllm_config = create_vllm_config(block_size=local_block_size)
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     vllm_config.cache_config.enable_prefix_caching = False
     # kv_buffer_device defaults to the *real* platform's device type, which on
     # a CPU-only test host would make this a host-buffer worker: host xfer
@@ -1222,11 +1279,21 @@ def test_mismatched_mla_kernel_page_rejected_for_mla_hybrid():
 
 
 def _make_csa_linear_ple_worker(
-    scratch_aliases: str = "compressed", ple_page_size: int = 256
+    scratch_aliases: str = "compressed",
+    ple_page_size: int | None = None,
+    *,
+    host_num_blocks: int | None = None,
+    device: str = "cpu",
+    allocator_layout: bool = False,
+    engine_id: str = "local-engine",
+    compact_indexer: bool = False,
+    device_num_blocks: int = 2,
+    truncate_ple_view: bool = False,
+    truncate_raw_view: bool = False,
+    cache_order: tuple[str, ...] | None = None,
+    ple_state_rows: int | None = None,
 ):
-    """``scratch_aliases`` selects which pages the compressor ring overlays;
-    ``ple_page_size`` widens the PLE page beyond the page it shares a region
-    with (block-outer layout: both start at byte 0 of the block)."""
+    """``scratch_aliases`` selects which pages the compressor ring overlays."""
     from unittest.mock import MagicMock
 
     from vllm.config import set_current_vllm_config
@@ -1246,9 +1313,19 @@ def _make_csa_linear_ple_worker(
         UniformTypeKVCacheSpecs,
     )
 
+    assert not compact_indexer or allocator_layout
+    assert device_num_blocks == 2 or allocator_layout
+    assert not truncate_ple_view or allocator_layout
+    assert not truncate_raw_view or allocator_layout
+    block_size = 32 if compact_indexer else 4
+    page_size = block_size * 16 * 2 * 2
+    if ple_page_size is None:
+        ple_page_size = page_size
+    if ple_state_rows is None:
+        ple_state_rows = 24 if compact_indexer else 6
     main_kv_specs = {
         f"main_kv.{index}": FullAttentionSpec(
-            block_size=4,
+            block_size=block_size,
             num_kv_heads=1,
             head_size=16,
             dtype=torch.float16,
@@ -1257,19 +1334,19 @@ def _make_csa_linear_ple_worker(
     }
     compressed_specs = {
         f"compressed.{index}": MLAAttentionSpec(
-            block_size=4,
+            block_size=block_size,
             num_kv_heads=1,
-            head_size=64,
+            head_size=8 if compact_indexer else 64,
             dtype=torch.float16,
-            tokens_per_state=2,
+            tokens_per_state=4 if compact_indexer else 2,
         )
         for index in range(2)
     }
     compressor_state_specs = {
         f"compressor_state.{index}": CircularBufferSpec(
-            block_size=2,
+            block_size=4 if compact_indexer else 2,
             num_kv_heads=1,
-            head_size=32,
+            head_size=8 if compact_indexer else 32,
             dtype=torch.float16,
         )
         for index in range(2)
@@ -1278,12 +1355,12 @@ def _make_csa_linear_ple_worker(
         block_size=1,
         shapes=((8, 3), (1, 4, 4)),
         dtypes=(torch.float16, torch.float32),
-        page_size_padded=256,
+        page_size_padded=page_size,
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
     ple_spec = MambaSpec(
         block_size=1,
-        shapes=((6, 3),),
+        shapes=((ple_state_rows, 3),),
         dtypes=(torch.float16,),
         page_size_padded=ple_page_size,
         mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
@@ -1304,7 +1381,16 @@ def _make_csa_linear_ple_worker(
         return KVCacheGroupSpec(list(specs), uniform)
 
     tensor_regions: tuple[tuple[str, ...], ...]
-    if scratch_aliases == "compressed":
+    if host_num_blocks is not None:
+        assert scratch_aliases == "compressed"
+        tensor_regions = (
+            ("main_kv.0",),
+            ("main_kv.1",),
+            ("compressed.0", "compressor_state.0"),
+            ("compressed.1", "compressor_state.1"),
+            ("mamba.sharded", "mamba.ple"),
+        )
+    elif scratch_aliases == "compressed":
         tensor_regions = (
             ("main_kv.0", "mamba.sharded", "mamba.ple"),
             ("main_kv.1",),
@@ -1319,11 +1405,10 @@ def _make_csa_linear_ple_worker(
             ("compressed.0",),
             ("compressed.1",),
         )
-    page_size = 256
-    # Region 0 hosts the PLE page: its blocks are as wide as the widest page.
-    block_strides = [max(page_size, ple_page_size)] + [page_size] * (
-        len(tensor_regions) - 1
-    )
+    block_strides = [
+        max(page_size, ple_page_size) if "mamba.ple" in names else page_size
+        for names in tensor_regions
+    ]
     region_sizes = [2 * stride for stride in block_strides]
     region_offsets = [sum(region_sizes[:index]) for index in range(len(region_sizes))]
     kv_cache_config = KVCacheConfig(
@@ -1346,12 +1431,76 @@ def _make_csa_linear_ple_worker(
             KVCacheGroupSpec(["mamba.ple"], ple_spec),
         ],
     )
+    if host_num_blocks is not None:
+        host_group = group(main_kv_specs)
+        host_group.host_resident = True
+        kv_cache_config.kv_cache_groups = [
+            host_group,
+            group(compressed_specs),
+            *kv_cache_config.kv_cache_groups[1:],
+        ]
+        kv_cache_config.hisparse_host_num_blocks = host_num_blocks
+        kv_cache_config.kv_cache_tensors = [
+            KVCacheTensor(
+                size=(host_num_blocks if region_index < 2 else 2) * page_size,
+                layers=list(layer_names),
+                layer_stride=0,
+                block_stride=page_size,
+                host_resident=region_index < 2,
+            )
+            for region_index, layer_names in enumerate(tensor_regions)
+        ]
 
-    vllm_config = create_vllm_config(block_size=4)
+    vllm_config = create_vllm_config(block_size=block_size)
+    vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
     vllm_config.cache_config.enable_prefix_caching = False
     vllm_config.kv_transfer_config.kv_buffer_device = "cuda"
+    allocated_caches = None
+    if allocator_layout:
+        from dataclasses import replace
+
+        from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups
+        from vllm.v1.kv_cache_layout import KVCacheLayout
+        from vllm.v1.worker.utils import allocate_kv_cache
+
+        vllm_config.cache_config.kv_cache_layout = "BLNHC"
+        device_groups = kv_cache_config.kv_cache_groups
+        if host_num_blocks is not None:
+            device_groups = device_groups[1:]
+        device_bytes_per_block = max(
+            group.kv_cache_spec.page_size_bytes for group in device_groups
+        )
+        device_config = get_kv_cache_config_from_groups(
+            vllm_config, device_groups, device_num_blocks * device_bytes_per_block
+        )
+        allocated_caches = allocate_kv_cache(
+            device_config, torch.device(device), KVCacheLayout.BLNHC
+        )
+        if truncate_ple_view:
+            allocated_caches["mamba.ple"] = allocated_caches["mamba.ple"][..., :-1]
+        if truncate_raw_view:
+            allocated_caches["compressor_state.0"] = allocated_caches[
+                "compressor_state.0"
+            ][..., :-1]
+        if host_num_blocks is not None:
+            vllm_config.cache_config.kv_cache_layout = "LBNHC"
+            host_config = get_kv_cache_config_from_groups(
+                vllm_config, [host_group], host_num_blocks * 2 * page_size
+            )
+            host_caches = allocate_kv_cache(
+                host_config, torch.device("cpu"), KVCacheLayout.LBNHC
+            )
+            allocated_caches = {**host_caches, **allocated_caches}
+            device_config.kv_cache_groups.insert(0, host_group)
+            device_config.kv_cache_tensors[:0] = [
+                replace(tensor, host_resident=True)
+                for tensor in host_config.kv_cache_tensors
+            ]
+            device_config.hisparse_host_num_blocks = host_num_blocks
+            vllm_config.cache_config.kv_cache_layout = "BLNHC"
+        kv_cache_config = device_config
     fake_backend = MagicMock()
-    fake_backend.get_supported_kernel_block_sizes.return_value = [4]
+    fake_backend.get_supported_kernel_block_sizes.return_value = [block_size]
     fake_backend.get_name.return_value = "TEST_ATTN"
     fake_backend.full_cls_name.return_value = "test.AttentionBackend"
     fake_platform = MagicMock()
@@ -1370,9 +1519,25 @@ def _make_csa_linear_ple_worker(
         ),
         set_current_vllm_config(vllm_config),
     ):
-        worker = NixlConnectorWorker(vllm_config, "local-engine", kv_cache_config)
+        worker = NixlConnectorWorker(vllm_config, engine_id, kv_cache_config)
+        if allocated_caches is not None:
+            if cache_order is not None:
+                assert set(cache_order) == set(allocated_caches)
+                allocated_caches = {
+                    name: allocated_caches[name] for name in cache_order
+                }
+            worker.register_kv_caches(allocated_caches)
+            return worker
         tensors = [
-            torch.zeros((2, stride), dtype=torch.uint8) for stride in block_strides
+            torch.zeros(
+                (
+                    host_num_blocks if host_num_blocks and index < 2 else 2,
+                    block_strides[index],
+                ),
+                dtype=torch.uint8,
+                device="cpu" if host_num_blocks and index < 2 else device,
+            )
+            for index in range(len(tensor_regions))
         ]
         worker.register_kv_caches(
             {
@@ -1387,26 +1552,738 @@ def _make_csa_linear_ple_worker(
 
 
 @pytest.mark.cpu_test
+def test_csa_linear_aliases_preserve_transfer_group_identity():
+    """P/D allocation aliases must not combine independently addressed groups."""
+    for host_num_blocks in (None, 3):
+        worker = _make_csa_linear_ple_worker(
+            allocator_layout=True, host_num_blocks=host_num_blocks
+        )
+        metadata = msgspec.msgpack.decode(
+            worker.xfer_handshake_metadata.agent_metadata_bytes,
+            type=NixlAgentMetadata,
+        )
+        assert metadata.region_group_ids is not None
+        for region, names in enumerate(metadata.region_members):
+            groups = {
+                worker.kv_cache_config.transfer_group_index_by_layer[name]
+                for name in names
+            }
+            assert groups == {metadata.region_group_ids[region]}
+
+        # Logical endpoints may share a backing registration without sharing
+        # the request's cache-group block IDs.
+        physical_ranges = [
+            (start, mem_type)
+            for ranges, mem_type in worker.nixl_wrapper.registration_requests
+            for start, *_ in ranges
+        ]
+        assert len(physical_ranges) == len(set(physical_ranges))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("compact_indexer", [False, True], ids=["equal", "smaller"])
+def test_csa_linear_ple_descriptors_cover_state_tensor(compact_indexer):
+    """A PLE alias must retain its full payload when the indexer page is smaller."""
+    worker = _make_csa_linear_ple_worker(
+        host_num_blocks=3, allocator_layout=True, compact_indexer=compact_indexer
+    )
+    ple = worker.device_kv_caches["mamba.ple"]
+    compressed = worker.device_kv_caches["compressed.0"]
+    assert ple.data_ptr() == compressed.data_ptr()
+    assert ple.stride(0) * ple.element_size() == (
+        compressed.stride(0) * compressed.element_size()
+    )
+    payload_bytes = ple[0].numel() * ple.element_size()
+    if compact_indexer:
+        assert compressed[0].nbytes < payload_bytes
+    prepared = worker.nixl_wrapper.transfer_descriptor_requests
+    assert len(prepared) == 1
+    descriptors, _ = prepared[0]
+    # The native descriptor list ends with one whole-state PLE descriptor per block.
+    ple_descriptors = descriptors[-ple.shape[0] :]
+    assert ple_descriptors[:, 0].tolist() == [
+        ple[block].data_ptr() for block in range(ple.shape[0])
+    ]
+    for address, length, _ in ple_descriptors.tolist():
+        assert length >= payload_bytes, (
+            "PLE descriptor truncates the actual state tensor: "
+            f"address={address}, length={length}, payload_bytes={payload_bytes}"
+        )
+        assert length <= ple.stride(0) * ple.element_size()
+        assert address + length <= ple[-1].data_ptr() + payload_bytes
+        assert any(
+            start <= address and address + length <= start + size
+            for rows, _ in worker.nixl_wrapper.registration_requests
+            for start, size, _, _ in rows
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("host_num_blocks", [None, 3], ids=["device", "host"])
+@pytest.mark.parametrize("compact_indexer", [False, True], ids=["equal", "smaller"])
+def test_csa_linear_remote_state_descriptors_follow_producer_allocation(
+    host_num_blocks, compact_indexer
+):
+    """D must address P's state tensors, even when D aliases different owners."""
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    producer = _make_csa_linear_ple_worker(
+        allocator_layout=True, engine_id="producer", compact_indexer=compact_indexer
+    )
+    consumer = _make_csa_linear_ple_worker(
+        host_num_blocks=host_num_blocks,
+        allocator_layout=True,
+        engine_id="consumer",
+        compact_indexer=compact_indexer,
+        device_num_blocks=3,
+    )
+    producer_caches = producer.device_kv_caches
+    consumer_caches = consumer.device_kv_caches
+    assert producer_caches["mamba.sharded"].data_ptr() == (
+        producer_caches["main_kv.0"].data_ptr()
+    )
+    consumer_state_owner = "main_kv.0" if host_num_blocks is None else "compressed.0"
+    assert consumer_caches["mamba.sharded"].data_ptr() == (
+        consumer_caches[consumer_state_owner].data_ptr()
+    )
+    producer_wire = producer.xfer_handshake_metadata
+    consumer_wire = consumer.xfer_handshake_metadata
+    assert producer_wire.compatibility_hash == consumer_wire.compatibility_hash
+    metadata = msgspec.msgpack.decode(
+        producer_wire.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    consumer_metadata = msgspec.msgpack.decode(
+        consumer_wire.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    if compact_indexer and host_num_blocks is not None:
+        # The allocator packs raw key 1 into different physical owners on P/D.
+        assert metadata.region_names is not None
+        assert consumer_metadata.region_names is not None
+        assert producer_caches["compressor_state.1"].data_ptr() != (
+            producer_caches["compressed.1"].data_ptr()
+        )
+        assert consumer_caches["compressor_state.1"].data_ptr() == (
+            consumer_caches["compressed.1"].data_ptr()
+        )
+        assert len({cache.data_ptr() for cache in producer_caches.values()}) == (
+            len({cache.data_ptr() for cache in consumer_caches.values()}) + 1
+        )
+        assert {name for names in metadata.region_members for name in names} == {
+            name for names in consumer_metadata.region_members for name in names
+        }
+    else:
+        assert metadata.region_names == consumer_metadata.region_names
+    wrapper = consumer.nixl_wrapper
+    before = len(wrapper.transfer_descriptor_requests)
+    consumer.add_remote_agent(metadata)
+    remote_descriptors = np.concatenate(
+        [rows for rows, _ in wrapper.transfer_descriptor_requests[before:]]
+    )
+    actual = {tuple(row[:2]) for row in remote_descriptors.tolist()}
+    for name in ("compressor_state.0", "compressor_state.1"):
+        for worker, wire_metadata in (
+            (producer, metadata),
+            (consumer, consumer_metadata),
+        ):
+            cache = worker.device_kv_caches[name]
+            assert wire_metadata.region_names is not None
+            assert wire_metadata.region_num_blocks is not None
+            assert wire_metadata.region_group_ids is not None
+            region = wire_metadata.region_names.index(name)
+            assert wire_metadata.region_members[region] == [name]
+            assert wire_metadata.kv_caches_base_addr[region] == cache.data_ptr()
+            assert wire_metadata.block_lens[region] == cache[0].nbytes
+            assert wire_metadata.block_strides[region] == (
+                cache.stride(0) * cache.element_size()
+            )
+            assert wire_metadata.region_num_blocks[region] == cache.shape[0]
+            assert (
+                wire_metadata.region_group_ids[region]
+                == (worker.kv_cache_config.transfer_group_index_by_layer[name])
+            )
+            assert cache[0].nbytes <= cache.stride(0) * cache.element_size()
+            assert any(
+                start <= cache.data_ptr()
+                and cache[-1].data_ptr() + cache[-1].nbytes <= start + size
+                for rows, _ in worker.nixl_wrapper.registration_requests
+                for start, size, _, _ in rows
+            )
+        raw = producer_caches[name]
+        assert {
+            (raw[block].data_ptr(), raw[block].nbytes) for block in range(raw.shape[0])
+        } <= actual
+    state = producer_caches["mamba.sharded"]
+    # DS conv: Q/K/V contain 2/2/4 dimensions of 3 fp16 values; SSM is fp32.
+    expected_state = {
+        (state[block].data_ptr() + offset, size)
+        for block in range(2)
+        for offset, size in ((0, 12), (12, 12), (24, 24), (48, 64))
+    }
+    assert expected_state <= actual, (
+        "Remote GDN descriptors must address the producer state tensor; "
+        f"missing={sorted(expected_state - actual)}"
+    )
+    ple = producer_caches["mamba.ple"]
+    local_ple = consumer_caches["mamba.ple"]
+    assert ple.shape[0] == 2 and local_ple.shape[0] == 3
+    if host_num_blocks is not None:
+        assert ple.stride(0) != local_ple.stride(0)
+    payload_bytes = ple[0].numel() * ple.element_size()
+    assert metadata.ple_state_size == consumer_metadata.ple_state_size == payload_bytes
+    assert {(ple[block].data_ptr(), payload_bytes) for block in range(2)} <= actual
+    assert not any(
+        address == ple.data_ptr() + 2 * ple.stride(0) * ple.element_size()
+        for address, _ in actual
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("host_num_blocks", [7, None], ids=["host", "device"])
+@pytest.mark.parametrize("permuted_endpoints", [False, True], ids=["same", "permuted"])
+def test_csa_linear_host_read_preserves_each_cache_group_byte_mapping(
+    host_num_blocks, permuted_endpoints
+):
+    """Public READ must map every state's bytes without targeting neighboring data."""
+    from collections import Counter
+
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+        NixlConnectorMetadata,
+    )
+
+    producer_order = consumer_order = None
+    if permuted_endpoints:
+        # Equivalent P/D owners may arrive from different allocator group orders.
+        producer_order = (
+            "compressed.0",
+            "compressor_state.0",
+            "compressor_state.1",
+            "compressed.1",
+            "main_kv.0",
+            "main_kv.1",
+            "mamba.sharded",
+            "mamba.ple",
+        )
+        consumer_order = (
+            "compressed.0",
+            "compressed.1",
+            "compressor_state.0",
+            "compressor_state.1",
+            "main_kv.0",
+            "main_kv.1",
+            "mamba.sharded",
+            "mamba.ple",
+        )
+    producer = _make_csa_linear_ple_worker(
+        allocator_layout=True,
+        engine_id="producer",
+        compact_indexer=True,
+        device_num_blocks=5,
+        cache_order=producer_order,
+    )
+    consumer = _make_csa_linear_ple_worker(
+        host_num_blocks=host_num_blocks,
+        allocator_layout=True,
+        engine_id="consumer",
+        compact_indexer=True,
+        device_num_blocks=6,
+        cache_order=consumer_order,
+    )
+    agent_metadata = msgspec.msgpack.decode(
+        producer.xfer_handshake_metadata.agent_metadata_bytes,
+        type=NixlAgentMetadata,
+    )
+    assert agent_metadata.layer_group_ids["mamba.sharded"] == 2
+    assert agent_metadata.layer_group_ids["mamba.ple"] == 3
+    if permuted_endpoints:
+        assert agent_metadata.region_names != consumer.region_names
+        assert set(agent_metadata.region_names) == set(consumer.region_names)
+    # Reuse the suite's simulated handshake-publication boundary. Registration
+    # itself and the request READ/completion entry points remain real.
+    _register_remote_agents(consumer, agent_metadata, tp_size=1)
+    request = NixlConnectorMetadata()
+    request.add_new_req_to_recv(
+        request_id="read-all-state",
+        local_block_ids=(
+            ([2], [1], [3], [4], [5])
+            if host_num_blocks is not None
+            else ([2], [3], [4], [5])
+        ),
+        kv_transfer_params={
+            "remote_block_ids": [[1], [2], [3], [4]],
+            "remote_engine_id": "producer",
+            "remote_request_id": "prefill-all-state",
+            "remote_host": "unused-preconnected-peer",
+            "remote_port": 1234,
+            "remote_num_tokens": 32,
+            "tp_size": 1,
+        },
+        local_num_computed_blocks=(0,) * (5 if host_num_blocks is not None else 4),
+        awaiting_kvs=True,
+    )
+
+    # Explicit semantic block ownership, independent of descriptor order/index:
+    # P combines main/indexer; D puts main on host and separates the indexer.
+    owned_rows = [
+        ("main_kv.0", 1, 2),
+        ("main_kv.1", 1, 2),
+        ("compressed.0", 1, 1 if host_num_blocks is not None else 2),
+        ("compressed.1", 1, 1 if host_num_blocks is not None else 2),
+        ("compressor_state.0", 2, 3),
+        ("compressor_state.1", 2, 3),
+        ("mamba.sharded", 3, 4),
+        ("mamba.ple", 4, 5),
+    ]
+    expected: Counter[tuple[int, int]] = Counter()
+    for name, source_block, destination_block in owned_rows:
+        source = producer.device_kv_caches[name][source_block]
+        destination = consumer.device_kv_caches[name][destination_block]
+        assert source.is_contiguous() and destination.is_contiguous()
+        assert source.nbytes == destination.nbytes
+        expected.update(
+            (destination.data_ptr() + offset, source.data_ptr() + offset)
+            for offset in range(source.nbytes)
+        )
+    assert all(count == 1 for count in expected.values())
+
+    consumer.start_load_kv(request)
+    wrapper = consumer.nixl_wrapper
+    assert wrapper.xfers, "the public READ path posted no native transfer"
+    actual: Counter[tuple[int, int]] = Counter()
+    for operation, local_handle, local_ids, remote_handle, remote_ids in wrapper.xfers:
+        assert operation == "READ"
+        assert len(local_ids) == len(remote_ids)
+        for local_id, remote_id in zip(local_ids, remote_ids, strict=True):
+            destination, local_size, _ = wrapper.dlists[local_handle][int(local_id)]
+            source, remote_size, _ = wrapper.dlists[remote_handle][int(remote_id)]
+            assert local_size == remote_size
+            actual.update(
+                (int(destination) + offset, int(source) + offset)
+                for offset in range(int(local_size))
+            )
+    # Exact byte-pair multiplicity catches missing state, wrong groups, duplicate
+    # writes and any destination bytes outside this request's owned payloads.
+    assert actual == expected
+    result = consumer.get_transfer_results()
+    assert result.finished_recving == {"read-all-state"}
+    assert not result.failed_recving
+    assert len(wrapper.started) == len(wrapper.xfers)
+    assert wrapper.checked == wrapper.started
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "invalid", ["absent", "missing", "negative", "extra", "region"]
+)
+def test_csa_linear_rejects_invalid_remote_owner_groups_before_descriptors(invalid):
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    producer = _make_csa_linear_ple_worker(allocator_layout=True, engine_id="producer")
+    consumer = _make_csa_linear_ple_worker(host_num_blocks=3, allocator_layout=True)
+    wire = msgspec.msgpack.decode(producer.xfer_handshake_metadata.agent_metadata_bytes)
+    if invalid == "absent":
+        del wire["layer_group_ids"]
+    elif invalid == "missing":
+        del wire["layer_group_ids"]["mamba.ple"]
+    elif invalid == "negative":
+        wire["layer_group_ids"]["mamba.ple"] = -1
+    elif invalid == "extra":
+        wire["layer_group_ids"]["unknown-owner"] = 0
+    else:
+        wire["layer_group_ids"]["compressor_state.0"] = 2
+    metadata = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(wire), type=NixlAgentMetadata
+    )
+    before = len(consumer.nixl_wrapper.transfer_descriptor_requests)
+    with pytest.raises(ValueError, match="CSA-linear .*layer_group_ids"):
+        consumer.add_remote_agent(metadata)
+    assert len(consumer.nixl_wrapper.transfer_descriptor_requests) == before
+    assert not consumer.nixl_wrapper.xfers
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "invalid", ["missing", "unknown", "duplicate", "merged", "payload", "capacity"]
+)
+def test_csa_linear_rejects_incompatible_endpoint_before_descriptors(invalid):
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    producer = _make_csa_linear_ple_worker(allocator_layout=True, engine_id="producer")
+    consumer = _make_csa_linear_ple_worker(host_num_blocks=3, allocator_layout=True)
+    metadata = msgspec.msgpack.decode(
+        producer.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    raw = next(
+        index
+        for index, names in enumerate(metadata.region_members)
+        if "compressor_state.0" in names
+    )
+    compressed = next(
+        index
+        for index, names in enumerate(metadata.region_members)
+        if "compressed.0" in names
+    )
+    expected = "CSA-linear .*"
+    if invalid == "missing":
+        metadata.region_members[raw].remove("compressor_state.0")
+    elif invalid == "unknown":
+        metadata.region_members[raw] = ["unknown.raw"]
+    elif invalid == "duplicate":
+        metadata.region_members[compressed].append("compressor_state.0")
+        expected = "Duplicate remote cache owner"
+    elif invalid == "merged":
+        metadata.region_members[raw].remove("compressor_state.0")
+        metadata.region_members[compressed].append("compressor_state.0")
+    elif invalid == "payload":
+        metadata.block_lens[raw] -= 1
+    else:
+        assert metadata.region_num_blocks is not None
+        metadata.region_num_blocks[raw] = 0
+    before = len(consumer.nixl_wrapper.transfer_descriptor_requests)
+    with pytest.raises(ValueError, match=expected):
+        consumer.add_remote_agent(metadata)
+    assert len(consumer.nixl_wrapper.transfer_descriptor_requests) == before
+    assert not consumer.nixl_wrapper.xfers
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("invalid", ["local-main", "local-raw", "remote-state"])
+def test_csa_linear_rejects_block_outside_its_own_pool_before_read(invalid):
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+        NixlConnectorMetadata,
+    )
+
+    producer = _make_csa_linear_ple_worker(
+        allocator_layout=True,
+        engine_id="producer",
+        compact_indexer=True,
+        device_num_blocks=5,
+    )
+    consumer = _make_csa_linear_ple_worker(
+        host_num_blocks=7,
+        allocator_layout=True,
+        compact_indexer=True,
+        device_num_blocks=6,
+    )
+    metadata = msgspec.msgpack.decode(
+        producer.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    _register_remote_agents(consumer, metadata, tp_size=1)
+    local = ([2], [1], [3], [4], [5])
+    remote = [[1], [2], [3], [4]]
+    if invalid == "local-main":
+        local[0][0] = 7
+    elif invalid == "local-raw":
+        local[2][0] = 6
+    else:
+        remote[2][0] = 5
+    request = NixlConnectorMetadata()
+    request.add_new_req_to_recv(
+        request_id="invalid-pool-block",
+        local_block_ids=local,
+        kv_transfer_params={
+            "remote_block_ids": remote,
+            "remote_engine_id": "producer",
+            "remote_request_id": "prefill-invalid",
+            "remote_host": "unused-preconnected-peer",
+            "remote_port": 1234,
+            "remote_num_tokens": 32,
+            "tp_size": 1,
+        },
+        awaiting_kvs=True,
+    )
+    with pytest.raises(
+        ValueError, match="CSA-linear block ID exceeds its cache capacity"
+    ):
+        consumer.start_load_kv(request)
+    assert not consumer.nixl_wrapper.xfers
+
+
+@pytest.mark.cpu_test
+def test_csa_linear_rejects_raw_view_that_truncates_payload():
+    """A raw alias must cover its own payload within the actual view."""
+    with pytest.raises(ValueError, match="Raw-key payload exceeds its cache view"):
+        _make_csa_linear_ple_worker(
+            host_num_blocks=3,
+            allocator_layout=True,
+            compact_indexer=True,
+            truncate_raw_view=True,
+        )
+
+
+@pytest.mark.cpu_test
+def test_csa_linear_rejects_ple_view_that_truncates_last_state():
+    """A larger backing allocation cannot make a shortened state view safe."""
+    with pytest.raises(ValueError, match="PLE state payload exceeds its cache view"):
+        _make_csa_linear_ple_worker(
+            host_num_blocks=3,
+            allocator_layout=True,
+            compact_indexer=True,
+            truncate_ple_view=True,
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "invalid_geometry",
+    [
+        "absent",
+        "zero",
+        "size",
+        "capacity",
+        "page_absent",
+        "page_boolean",
+        "page_size",
+        "page_stride",
+    ],
+)
+def test_csa_linear_rejects_incompatible_remote_ple_payload(invalid_geometry):
+    """Reject absent or mismatched PLE state lengths before preparing descriptors."""
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    producer = _make_csa_linear_ple_worker(allocator_layout=True, engine_id="producer")
+    consumer = _make_csa_linear_ple_worker(host_num_blocks=3, allocator_layout=True)
+    wire = msgspec.msgpack.decode(producer.xfer_handshake_metadata.agent_metadata_bytes)
+    if invalid_geometry == "absent":
+        del wire["ple_state_size"]
+    metadata = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(wire), type=NixlAgentMetadata
+    )
+    expected = "PLE state payload sizes must match"
+    expected_error = ValueError
+    if invalid_geometry == "absent":
+        assert metadata.ple_state_size is None
+    elif invalid_geometry in ("capacity", "page_stride"):
+        assert metadata.region_num_blocks is not None
+        region = next(
+            index
+            for index, names in enumerate(metadata.region_members)
+            if "mamba.ple" in names
+        )
+        if invalid_geometry == "capacity":
+            metadata.region_num_blocks[region] = 1
+            expected = "PLE state blocks exceed the remote region capacity"
+        else:
+            metadata.block_strides[region] = 35
+            # Public handshake rejects impossible region geometry even earlier.
+            expected_error = AssertionError
+            expected = "^$"
+            with pytest.raises(
+                ValueError, match="PLE state payload exceeds the remote block stride"
+            ):
+                consumer._build_mamba_remote(
+                    metadata,
+                    tp_ratio=1,
+                    transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
+                )
+    elif invalid_geometry.startswith("page_"):
+        metadata.ple_block_len = {
+            "page_absent": None,
+            "page_boolean": True,
+            "page_size": 128,
+        }[invalid_geometry]
+        expected = "PLE pages require identical P/D geometry"
+    else:
+        assert metadata.ple_state_size == 36
+        metadata.ple_state_size = 0 if invalid_geometry == "zero" else 35
+    wrapper = consumer.nixl_wrapper
+    before = len(wrapper.transfer_descriptor_requests)
+    with pytest.raises(expected_error, match=expected):
+        consumer.add_remote_agent(metadata)
+    assert len(wrapper.transfer_descriptor_requests) == before
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "invalid_mapping", ["absent", "missing_gdn", "missing_ple", "duplicate"]
+)
+def test_csa_linear_rejects_incomplete_remote_state_mapping(invalid_mapping):
+    """Matching physical region names do not prove a legacy state alias is safe."""
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    producer = _make_csa_linear_ple_worker(allocator_layout=True, engine_id="producer")
+    consumer = _make_csa_linear_ple_worker(
+        host_num_blocks=3, allocator_layout=True, engine_id="consumer"
+    )
+    metadata = msgspec.msgpack.decode(
+        producer.xfer_handshake_metadata.agent_metadata_bytes,
+        type=NixlAgentMetadata,
+    )
+    if invalid_mapping == "absent":
+        metadata.region_members = []
+        expected = "requires remote region_members"
+    elif invalid_mapping.startswith("missing"):
+        missing_name = (
+            "mamba.sharded" if invalid_mapping == "missing_gdn" else "mamba.ple"
+        )
+        metadata.region_members = [
+            [name for name in names if name != missing_name]
+            for names in metadata.region_members
+        ]
+        expected = "Missing remote state cache owners"
+    else:
+        metadata.region_members[1].append("mamba.sharded")
+        expected = "Duplicate remote cache owner"
+    wrapper = consumer.nixl_wrapper
+    before = len(wrapper.transfer_descriptor_requests)
+    with pytest.raises(ValueError, match=expected):
+        consumer.add_remote_agent(metadata)
+    assert len(wrapper.transfer_descriptor_requests) == before
+
+
+@pytest.mark.cpu_test
+def test_csa_linear_host_pool_registers_every_transferable_page():
+    """A hybrid device pool must not truncate the independent host KV pool."""
+    worker = _make_csa_linear_ple_worker(host_num_blocks=3)
+    registered_ranges = [
+        descriptor
+        for descriptors, _ in worker.nixl_wrapper.registered
+        for descriptor in descriptors
+    ]
+    host_ranges = [
+        (int(address), int(size))
+        for address, size, _, _ in registered_ranges
+        if size == 3 * 256
+    ]
+    assert len(host_ranges) == 2
+    prepared = np.concatenate(list(worker.nixl_wrapper.dlists.values()))
+    for address, size in host_ranges:
+        descriptors = prepared[
+            (prepared[:, 0] >= address) & (prepared[:, 0] < address + size)
+        ]
+        assert descriptors[:, :2].tolist() == [
+            [address, 256],
+            [address + 256, 256],
+            [address + 512, 256],
+        ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA cache registration")
+def test_csa_linear_mixed_memory_registration_includes_gdn_and_ple():
+    """All state descriptors must enter the handle for their actual memory type."""
+    worker = _make_csa_linear_ple_worker(host_num_blocks=3, device="cuda")
+    wrapper = worker.nixl_wrapper
+    assert len(wrapper.registration_requests) == 2
+    assert len(wrapper.transfer_descriptor_requests) == 2
+    registered = {
+        mem_type: descriptors for descriptors, mem_type in wrapper.registration_requests
+    }
+    prepared = {
+        mem_type: descriptors
+        for descriptors, mem_type in wrapper.transfer_descriptor_requests
+    }
+    assert registered.keys() == prepared.keys() == {"DRAM", "VRAM"}
+    assert [size for _, size, _, _ in registered["DRAM"]] == [768, 768]
+    assert [size for _, size, _, _ in registered["VRAM"]] == [512, 512, 512]
+    assert prepared["DRAM"].shape == (6, 3)
+    # Six device regions have two whole-page slots each. GDN and PLE keep
+    # distinct logical slots even when they share a physical backing tensor.
+    assert prepared["VRAM"].shape == (22, 3)
+    assert prepared["DRAM"][:, 1].tolist() == [256] * 6
+    assert sorted(prepared["VRAM"][:, 1].tolist()) == (
+        [12] * 4 + [24] * 2 + [36] * 2 + [64] * 2 + [256] * 12
+    )
+    for mem_type, descriptors in prepared.items():
+        for address, length, device_id in descriptors.tolist():
+            assert any(
+                start <= address
+                and address + length <= start + size
+                and device_id == registered_device
+                for start, size, registered_device, _ in registered[mem_type]
+            ), (mem_type, address, length, device_id)
+
+
+@pytest.mark.cpu_test
 def test_csa_linear_registration_discovers_shared_regions():
     worker = _make_csa_linear_ple_worker()
 
-    assert worker._ssm_region_indices == [0]
+    assert worker._ssm_region_indices == [1]
     assert worker._ple_group_index == 3
-    assert worker._ple_region_index == 0
-    assert worker._region_is_mla == [False, False, True, True]
-    assert worker._scratch_region_indices == [2, 3]
+    assert worker._ple_region_index == 2
+    assert worker.region_names == [
+        "main_kv.0",
+        "mamba.sharded",
+        "mamba.ple",
+        "main_kv.1",
+        "compressed.0",
+        "compressor_state.0",
+        "compressed.1",
+        "compressor_state.1",
+    ]
+    assert worker._region_is_mla == [
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert worker._scratch_region_indices == [5, 7]
+    for index, region in enumerate(worker._scratch_region_indices):
+        name = f"compressor_state.{index}"
+        raw = worker.device_kv_caches[name]
+        compressed = worker.device_kv_caches[f"compressed.{index}"]
+        assert raw.data_ptr() == compressed.data_ptr()
+        assert worker.region_members[region] == [name]
+        assert worker.region_group_ids[region] == 1
+        assert worker.kv_caches_base_addr[worker.engine_id][0][region] == (
+            raw.data_ptr()
+        )
 
 
 @pytest.mark.cpu_test
 def test_csa_linear_scratch_descs_follow_the_pages_they_overlay():
-    """The scratch ring is addressed by the regions it actually registered in,
-    not by inferring that it must sit on the MLA pages: overlaying the main KV
-    pages instead moves its descriptors with it."""
+    """Raw descriptors keep their own identity when they alias main KV pages."""
     worker = _make_csa_linear_ple_worker(scratch_aliases="main_kv")
 
-    # Same MLA regions as before, but the ring now lives in the non-MLA ones.
-    assert worker._region_is_mla == [False, False, True, True]
-    assert worker._scratch_region_indices == [0, 1]
+    assert worker.region_names == [
+        "main_kv.0",
+        "mamba.sharded",
+        "mamba.ple",
+        "compressor_state.0",
+        "main_kv.1",
+        "compressor_state.1",
+        "compressed.0",
+        "compressed.1",
+    ]
+    assert worker._region_is_mla == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
+    assert worker._scratch_region_indices == [3, 5]
 
     desc_ids = worker._compute_desc_ids(
         block_ids=([1], [0], [1], [1]),
@@ -1414,9 +2291,17 @@ def test_csa_linear_scratch_descs_follow_the_pages_they_overlay():
         block_size_ratio=None,
         physical_blocks_per_logical=1,
     )
-    # Scratch group (block 0) now maps to regions 0 and 1 -> descs 0 and 2,
-    # where the compressed-page placement gave 4 and 6.
-    assert desc_ids.tolist()[4:6] == [0, 2]
+    raw_desc_ids = desc_ids[8:10]
+    assert raw_desc_ids.tolist() == [6, 10]
+    descriptors, _ = worker.nixl_wrapper.transfer_descriptor_requests[0]
+    for index, desc_id in enumerate(raw_desc_ids):
+        raw = worker.device_kv_caches[f"compressor_state.{index}"]
+        main = worker.device_kv_caches[f"main_kv.{index}"]
+        assert raw.data_ptr() == main.data_ptr()
+        assert descriptors[desc_id, :2].tolist() == [
+            raw[0].data_ptr(),
+            raw[0].nbytes,
+        ]
 
 
 @pytest.mark.cpu_test
@@ -1434,14 +2319,25 @@ def test_csa_linear_selects_compressed_sparse_compressor_state_and_mamba_regions
         3,
         5,
         7,
-        4,
-        6,
         9,
         11,
         13,
         15,
+        10,
+        14,
         17,
+        19,
+        21,
+        23,
+        25,
     ]
+    descriptors, _ = worker.nixl_wrapper.transfer_descriptor_requests[0]
+    for index, desc_id in enumerate(desc_ids[8:10]):
+        raw = worker.device_kv_caches[f"compressor_state.{index}"]
+        assert descriptors[desc_id, :2].tolist() == [
+            raw[0].data_ptr(),
+            raw[0].nbytes,
+        ]
 
     mamba_only = worker._compute_desc_ids(
         block_ids=([], [], [1], [1]),
@@ -1449,7 +2345,7 @@ def test_csa_linear_selects_compressed_sparse_compressor_state_and_mamba_regions
         block_size_ratio=None,
         physical_blocks_per_logical=1,
     )
-    assert mamba_only.tolist() == [9, 11, 13, 15, 17]
+    assert mamba_only.tolist() == [17, 19, 21, 23, 25]
 
 
 @pytest.mark.cpu_test
@@ -1459,14 +2355,15 @@ def test_csa_linear_ple_descriptor_is_not_split():
     )
 
     worker = _make_csa_linear_ple_worker()
-    bases = [0x10000, 0x20000, 0x30000, 0x40000]
-    attention = worker._build_fa_local(bases, block_size_ratio=1)
-    mamba = worker._build_mamba_local(bases)
-    # One (addr, len, dev, stride, count) run per region / sub-region.
-    assert attention.shape == (4, 5)
-    assert mamba.shape == (5, 5)
-    # PLE run: 2 whole 256-byte pages at 0x10000, 0x10100.
-    assert mamba[-1].tolist() == [0x10000, 256, 0, 256, 2]
+    bases = [0x10000, 0x10000, 0x10000, 0x20000, 0x30000, 0x30000, 0x40000, 0x40000]
+    attention_runs = worker._build_fa_local(bases, block_size_ratio=1)
+    mamba_runs = worker._build_mamba_local(bases)
+    attention = expand_strided_descs(attention_runs)
+    mamba = expand_strided_descs(mamba_runs)
+    assert attention.shape == (16, 3)
+    assert mamba.shape == (10, 3)
+    assert mamba[-2:, 0].tolist() == [0x10000, 0x10100]
+    assert mamba[-2:, 1].tolist() == [36, 36]
 
     mapping = TPMapping(
         source_ranks_per_group=((0,), (0,), (0, 1), (0, 1)),
@@ -1477,16 +2374,16 @@ def test_csa_linear_ple_descriptor_is_not_split():
     splits = list(
         worker._build_local_splits_from_plan(
             mapping,
-            np.concatenate([attention, mamba]),
-            num_fa_descs=int(attention[:, 4].sum()),
+            np.concatenate([attention_runs, mamba_runs]),
+            num_fa_descs=len(attention),
         )
     )
+    splits = [expand_strided_descs(split) for split in splits]
     assert len(splits) == 2
-    for split in splits:
-        # The PLE run is copied whole to every source rank, while the sharded
-        # SSM run right before it is halved per source.
-        assert split[-1].tolist() == mamba[-1].tolist()
-        assert split[-2, 1] * 2 == mamba[-2, 1]
+    assert [row[1] for row in splits[0][-2:]] == [36, 36]
+    assert [row[1] for row in splits[1][-2:]] == [36, 36]
+    assert splits[0][-3][1] * 2 == mamba[-3, 1]
+    assert splits[1][-3][1] * 2 == mamba[-3, 1]
 
 
 @pytest.mark.cpu_test
@@ -1517,15 +2414,23 @@ def test_csa_linear_remote_ple_is_copied_whole():
         ple_block_len=256,
         attn_backend_name="test",
         physical_blocks_per_logical_kv_block=1,
+        region_members=[
+            ["main_kv.0", "mamba.sharded", "mamba.ple"],
+            ["main_kv.1"],
+            ["compressed.0", "compressor_state.0"],
+            ["compressed.1", "compressor_state.1"],
+        ],
+        ple_state_size=36,
     )
     descriptors = worker._build_mamba_remote(
         metadata,
         tp_ratio=-2,
         transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
     )
-    assert descriptors.shape == (5, 5)
-    # PLE run: 2 whole 256-byte pages at 0x10000, 0x10100.
-    assert descriptors[-1].tolist() == [0x10000, 256, 0, 256, 2]
+    descriptors = expand_strided_descs(descriptors)
+    assert descriptors.shape == (10, 3)
+    assert descriptors[-2:, 0].tolist() == [0x10000, 0x10100]
+    assert descriptors[-2:, 1].tolist() == [36, 36]
 
     metadata.ple_block_len = 128
     with pytest.raises(ValueError, match="PLE pages require identical"):
@@ -1534,30 +2439,53 @@ def test_csa_linear_remote_ple_is_copied_whole():
             tp_ratio=-2,
             transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
         )
+    metadata.ple_block_len = 256
+    metadata.ple_state_size = 35
+    with pytest.raises(ValueError, match="PLE state payload sizes must match"):
+        worker._build_mamba_remote(
+            metadata,
+            tp_ratio=-2,
+            transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
+        )
 
 
 @pytest.mark.cpu_test
-def test_csa_linear_ple_page_wider_than_the_shared_region_page():
-    """The PLE page is discovered in the region of the main KV page registered
-    first (both start at byte 0 of the block); its descriptors must still cover
-    the whole PLE page, not the region's block_len."""
-    worker = _make_csa_linear_ple_worker(ple_page_size=384)
+@pytest.mark.parametrize("ple_state_rows", [6, 64])
+def test_csa_linear_ple_page_wider_than_the_shared_region_page(ple_state_rows):
+    """Use the PLE owner's page, covering every active byte without padding."""
+    worker = _make_csa_linear_ple_worker(
+        ple_page_size=384, ple_state_rows=ple_state_rows
+    )
+    active_bytes = ple_state_rows * 3 * 2
 
-    assert worker._ple_region_index == 0
-    assert worker.block_len_per_layer[0] == 256
-    assert worker.block_stride_per_layer[0] == 384
+    assert worker._ple_region_index == 2
+    assert worker.block_len_per_layer[2] == 384
+    assert worker.block_stride_per_layer[2] == 384
     assert worker._ple_block_len == 384
 
-    bases = [0x10000, 0x20000, 0x30000, 0x40000]
-    mamba = worker._build_mamba_local(bases)
-    # PLE run: 2 whole 384-byte pages at 0x10000, 0x10000 + 384.
-    assert mamba[-1].tolist() == [0x10000, 384, 0, 384, 2]
+    bases = [0x10000, 0x10000, 0x10000, 0x20000, 0x30000, 0x30000, 0x40000, 0x40000]
+    mamba = expand_strided_descs(worker._build_mamba_local(bases))
+    assert mamba[-2:, 0].tolist() == [0x10000, 0x10000 + 384]
+    assert mamba[-2:, 1].tolist() == [active_bytes, active_bytes]
 
     metadata = msgspec.msgpack.decode(
         worker.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
     )
     assert metadata.ple_block_len == 384
+    assert metadata.ple_state_size == active_bytes
     assert metadata.block_lens[0] == 256
+    assert metadata.block_lens[2] == 384
+    remote = worker._build_mamba_remote(
+        metadata,
+        tp_ratio=1,
+        transfer_info=SimpleNamespace(remote_physical_blocks_per_logical=1),
+    )
+    remote = expand_strided_descs(remote)
+    assert remote[-2:, 0].tolist() == [
+        metadata.kv_caches_base_addr[2],
+        metadata.kv_caches_base_addr[2] + 384,
+    ]
+    assert remote[-2:, 1].tolist() == [active_bytes, active_bytes]
 
 
 def _make_ring_worker():
@@ -1653,11 +2581,35 @@ def _make_ring_worker():
 
 
 @pytest.mark.cpu_test
+def test_mla_hybrid_without_ple_accepts_metadata_without_ple_payload():
+    """The optional PLE field does not change non-PLE handshake decoding."""
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+    )
+
+    worker = _make_mla_hybrid_worker(
+        local_block_size=12, kernel_block_size=4, num_logical_blocks=2
+    )
+    wire = msgspec.msgpack.decode(worker.xfer_handshake_metadata.agent_metadata_bytes)
+    del wire["ple_state_size"]
+    wire["engine_id"] = "legacy-mla-producer"
+    metadata = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(wire), type=NixlAgentMetadata
+    )
+    assert metadata.ple_state_size is None
+    before = len(worker.nixl_wrapper.transfer_descriptor_requests)
+    worker.add_remote_agent(metadata)
+    assert len(worker.nixl_wrapper.transfer_descriptor_requests) > before
+
+
+@pytest.mark.cpu_test
 def test_ring_scratch_without_mamba_registers_and_addresses_its_own_regions():
     worker = _make_ring_worker()
 
     assert worker._ple_group_index is None
-    assert worker._scratch_region_indices == [1]
+    assert worker._scratch_region_indices == [2]
 
     desc_ids = worker._compute_desc_ids(
         block_ids=([1], [0]),
@@ -1666,4 +2618,141 @@ def test_ring_scratch_without_mamba_registers_and_addresses_its_own_regions():
         physical_blocks_per_logical=1,
     )
     # Paged block 1 in both regions; ring block 0 only in its scratch region.
-    assert sorted(desc_ids.tolist()) == sorted([0 * 2 + 1, 1 * 2 + 1, 1 * 2 + 0])
+    assert sorted(desc_ids.tolist()) == sorted([0 * 2 + 1, 1 * 2 + 1, 2 * 2 + 0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA cache registration")
+@pytest.mark.parametrize("failed_memory", [None, "DRAM", "VRAM"])
+def test_csa_linear_split_read_retires_all_legs_before_rank_completion(
+    failed_memory, monkeypatch
+):
+    """A failed state cannot publish completion while a sibling READ is live."""
+    import msgspec
+
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+        NixlAgentMetadata,
+        NixlConnectorMetadata,
+    )
+    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+
+    producer = _make_csa_linear_ple_worker(
+        allocator_layout=True,
+        engine_id="producer",
+        compact_indexer=True,
+        device_num_blocks=5,
+        device="cuda",
+    )
+    consumer = _make_csa_linear_ple_worker(
+        host_num_blocks=7,
+        allocator_layout=True,
+        engine_id="consumer",
+        compact_indexer=True,
+        device_num_blocks=6,
+        device="cuda",
+    )
+    metadata = msgspec.msgpack.decode(
+        producer.xfer_handshake_metadata.agent_metadata_bytes, type=NixlAgentMetadata
+    )
+    _register_remote_agents(consumer, metadata, tp_size=1)
+    request_id = "split-state"
+    request = NixlConnectorMetadata()
+    request.add_new_req_to_recv(
+        request_id=request_id,
+        local_block_ids=([2], [1], [3], [4], [5]),
+        kv_transfer_params={
+            "remote_block_ids": [[1], [2], [3], [4]],
+            "remote_engine_id": "producer",
+            "remote_request_id": "prefill-state",
+            "remote_host": "unused-preconnected-peer",
+            "remote_port": 1234,
+            "remote_num_tokens": 32,
+            "tp_size": 1,
+        },
+        local_num_computed_blocks=(0,) * 5,
+        awaiting_kvs=True,
+    )
+    wrapper = consumer.nixl_wrapper
+    original_prepare = wrapper.make_prepped_xfer
+    handle_memory = {}
+
+    def prepare(*args, **kwargs):
+        handle = original_prepare(*args, **kwargs)
+        _, local_list, local_ids, _, _ = wrapper.xfers[-1]
+        memory_types = set()
+        for address, size, _ in wrapper.dlists[local_list][local_ids]:
+            matches = {
+                memory
+                for rows, memory in wrapper.registration_requests
+                for base, length, _, _ in rows
+                if base <= address and address + size <= base + length
+            }
+            assert len(matches) == 1
+            memory_types.update(matches)
+        assert len(memory_types) == 1
+        handle_memory[handle] = memory_types.pop()
+        return handle
+
+    monkeypatch.setattr(wrapper, "make_prepped_xfer", prepare)
+    notify = MagicMock()
+    release = MagicMock()
+    monkeypatch.setattr(wrapper, "send_notif", notify)
+    monkeypatch.setattr(wrapper, "release_xfer_handle", release)
+    consumer.start_load_kv(request)
+    assert len(handle_memory) == 2
+    assert set(handle_memory.values()) == {"DRAM", "VRAM"}
+    assert wrapper.started == set(handle_memory)
+    first_memory = failed_memory or "DRAM"
+    first_handle = next(
+        h for h, memory in handle_memory.items() if memory == first_memory
+    )
+    pending_handle = next(h for h in handle_memory if h != first_handle)
+    states = {first_handle: "ERR" if failed_memory else "DONE", pending_handle: "PROC"}
+
+    def check(handle):
+        assert handle in wrapper.started
+        wrapper.checked.add(handle)
+        return states[handle]
+
+    monkeypatch.setattr(wrapper, "check_xfer_state", check)
+    pending = consumer.get_transfer_results()
+    assert not pending.finished_recving and not pending.failed_recving
+    release.assert_called_once_with(first_handle)
+    notify.assert_not_called()
+    assert wrapper.checked == wrapper.started
+
+    states[pending_handle] = "DONE"
+    finished = consumer.get_transfer_results()
+    expected_failures = {request_id} if failed_memory else set()
+    assert finished.finished_recving == {request_id}
+    assert finished.failed_recving == expected_failures
+    assert [call.args[0] for call in release.call_args_list] == [
+        first_handle,
+        pending_handle,
+    ]
+    if failed_memory:
+        notify.assert_not_called()
+    else:
+        notify.assert_called_once()
+    repeated = consumer.get_transfer_results()
+    assert not repeated.finished_recving and not repeated.failed_recving
+
+    def output(completed=None, failed=None):
+        return ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            kv_connector_output=KVConnectorOutput(
+                finished_recving=completed,
+                failed_recving=failed or set(),
+            ),
+        )
+
+    aggregator = KVOutputAggregator(expected_finished_count=2)
+    first_rank = aggregator.aggregate(
+        [output(finished.finished_recving, finished.failed_recving), output()]
+    )
+    assert not first_rank.kv_connector_output.finished_recving
+    assert not first_rank.kv_connector_output.failed_recving
+    both_ranks = aggregator.aggregate([output(), output({request_id})])
+    assert both_ranks.kv_connector_output.finished_recving == {request_id}
+    assert both_ranks.kv_connector_output.failed_recving == expected_failures

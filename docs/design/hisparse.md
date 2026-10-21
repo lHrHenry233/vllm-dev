@@ -106,6 +106,32 @@ not establish the others. Cache-correctness checks and model-quality evaluations
 do not establish throughput, latency, or capacity gains; those require separate
 workload-specific measurements.
 
+### Experimental QSA NIXL transfers
+
+Compose `NixlConnector` with `HiSparseConnector` through `MultiConnector` for
+QSA hybrid P/D transfers. The pull implementation requires equal P/D TP sizes,
+PP/PCP/DCP sizes of one, matching cache layouts and block sizes, and one physical
+block per logical block. Other configurations are rejected before a READ starts.
+
+The pull path requires homogeneous producer memory. A QSA producer with
+HiSparse enabled mixes DRAM main K/V with GPU indexer and recurrent caches,
+which the current NIXL pull implementation rejects. Use HiSparse disabled on P
+and enabled on D for this configuration. Choosing production P/D offload settings
+still requires workload-specific measurements.
+
+Each TP rank transfers its own main K/V and recurrent-state shards. Indexer
+cache regions and PLE state are mapped to their owning cache groups; PLE
+transfers cover the active state payload rather than allocation padding.
+Each endpoint's metadata must match its own registered region geometry.
+P/D pool capacities may differ; region ownership and active payload geometry
+must be compatible. Both endpoints must use the same connector schema and
+compatible model/cache configurations, including matching draft models when MTP
+is enabled. A matching numeric wire version alone does not establish compatibility.
+
+These restrictions describe the experimental implementation. The single-engine
+validation table above does not establish QSA P/D model quality, host refill, or
+MTP/FULL/async combinations. Those paths require separate end-to-end validation.
+
 ## Ownership
 
 | Thing | Owner | What “owner” means |
