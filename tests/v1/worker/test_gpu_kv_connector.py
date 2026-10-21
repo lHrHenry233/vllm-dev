@@ -119,3 +119,76 @@ def test_deferred_finalize_collects_results_before_saving(
 
     connector.finalize_step()
     assert events == ["handle", "bind", "start", "results", "wait", "clear"]
+
+
+@pytest.mark.parametrize("already_disabled", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_disabled_scope_preserves_connector_state(monkeypatch, already_disabled, fail):
+    """Nested dummy work must restore layer hooks, including on failure."""
+    monkeypatch.setattr(
+        kv_connector_module.kv_transfer_state, "_KV_CONNECTOR_AGENT", None
+    )
+    events: list[str] = []
+    connector = _make_connector(monkeypatch, events)
+    connector.set_disabled(already_disabled)
+
+    def run():
+        with connector.disabled():
+            with connector.disabled():
+                connector.pre_forward(_scheduler_output(True))
+                assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is None
+            assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is None
+            if fail:
+                raise RuntimeError("dummy failed")
+
+    if fail:
+        with pytest.raises(RuntimeError, match="dummy failed"):
+            run()
+    else:
+        run()
+
+    assert events == []
+    expected = None if already_disabled else connector.kv_connector
+    assert kv_connector_module.kv_transfer_state._KV_CONNECTOR_AGENT is expected
+    connector.pre_forward(_scheduler_output(True))
+    assert events == ([] if already_disabled else ["handle", "bind", "start"])
+
+
+@pytest.mark.parametrize("entry_enabled", [False, True])
+def test_disabled_scope_preserves_global_state_across_wrappers(
+    dist_init, tmp_path, entry_enabled
+):
+    """A different wrapper must not re-enable hooks inside an outer scope."""
+    from vllm.config import CacheConfig, VllmConfig
+    from vllm.distributed.kv_transfer import kv_transfer_state
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    config = VllmConfig(
+        cache_config=CacheConfig(block_size=16),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="ExampleConnector",
+            kv_role="kv_consumer",
+            kv_connector_extra_config={"shared_storage_path": str(tmp_path)},
+        ),
+    )
+    caches = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
+    kv_transfer_state.ensure_kv_transfer_shutdown()
+    kv_transfer_state.ensure_kv_transfer_initialized(config, caches)
+    connector = ActiveKVConnector(config, {})
+    try:
+        inner = ActiveKVConnector(config, {})
+        gate = ActiveKVConnector(config, {})
+        gate.set_disabled(not entry_enabled)
+        entry_agent = connector.kv_connector if entry_enabled else None
+
+        with connector.disabled():
+            with inner.disabled():
+                assert not kv_transfer_state.has_kv_transfer_group()
+            assert not kv_transfer_state.has_kv_transfer_group()
+        if entry_agent is None:
+            assert not kv_transfer_state.has_kv_transfer_group()
+        else:
+            assert kv_transfer_state.get_kv_transfer_group() is entry_agent
+    finally:
+        connector.set_disabled(False)
+        kv_transfer_state.ensure_kv_transfer_shutdown()

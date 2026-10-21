@@ -690,10 +690,6 @@ class HiSparseIndexGroup:
         self.lru_init = torch.arange(region_stride, dtype=torch.int16, device=device)
         self.lru_slots = self.lru_init.repeat(max_num_reqs, 1).contiguous()
         self.shared_topk = _create_shared_topk_state(device, max_swap_rows, top_k)
-        # Request ids the resolver reads, built on the copy stream: a
-        # compute-stream write would race with its logical_topk_ready wait.
-        self.row_indices = torch.arange(max_swap_rows, dtype=torch.int32, device=device)
-        self.request_ids = torch.empty_like(self.row_indices)
         self.copy_stream = (
             copy_stream if copy_stream is not None else _create_copy_stream(device)
         )
@@ -877,6 +873,95 @@ class HiSparseRuntime:
         )
         return staged
 
+    def gather_selected_cache(
+        self,
+        resident: HiSparseCacheHandle,
+        token_to_req: torch.Tensor,
+        logical_indices: torch.Tensor,
+        valid_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage independent query rows without mutating shared hot-cache state."""
+        assert resident.view is not None and resident.block_table is not None
+        assert resident.source_block_table is not None
+        block_size = resident.view.block_size
+        num_tokens, width = logical_indices.shape
+        padded_width = (width + block_size - 1) // block_size * block_size
+        if padded_width != width:
+            logical_indices = torch.cat(
+                (
+                    logical_indices,
+                    torch.full(
+                        (num_tokens, padded_width - width),
+                        -1,
+                        dtype=logical_indices.dtype,
+                        device=logical_indices.device,
+                    ),
+                ),
+                dim=1,
+            )
+        columns = torch.arange(padded_width, device=logical_indices.device)
+        requests = token_to_req.to(torch.long)
+        source_table = resident.source_block_table
+        resident_table = resident.block_table
+        state_indices = self.request_state_indices
+        assert state_indices is not None
+        num_requests = min(source_table.shape[0], state_indices.shape[0])
+        valid = (columns[None, :] < valid_counts[:, None]) & (logical_indices >= 0)
+        valid &= (requests[:, None] >= 0) & (requests[:, None] < num_requests)
+        safe_requests = requests.clamp(min=0, max=num_requests - 1)
+        # Host pages use batch rows; resident pages use persistent state rows.
+        state_rows = state_indices[safe_requests].to(torch.long)
+        valid &= (state_rows[:, None] >= 0) & (
+            state_rows[:, None] < resident_table.shape[0]
+        )
+        safe_state_rows = state_rows.clamp(min=0, max=resident_table.shape[0] - 1)
+        logical_blocks = logical_indices.clamp_min(0).to(torch.long) // block_size
+        source_blocks = source_table[
+            safe_requests[:, None], logical_blocks.clamp(max=source_table.shape[1] - 1)
+        ]
+        resident_blocks = resident_table[
+            safe_state_rows[:, None],
+            logical_blocks.clamp(max=resident_table.shape[1] - 1),
+        ]
+        offsets = logical_indices.remainder(block_size).to(torch.long)
+        source_rows = source_blocks.to(torch.long) * block_size + offsets
+        source_valid = (
+            valid
+            & (logical_blocks < source_table.shape[1])
+            & (source_blocks > 0)
+            & (source_rows < self.host_cache.shape[0])
+        )
+        resident_valid = (
+            valid
+            & (logical_blocks < resident_table.shape[1])
+            & (resident_blocks > 0)
+            & (resident_blocks < resident.view.cache.shape[0])
+        )
+        # The indexed result is the staging allocation itself. This handles
+        # strided resident pages without another full-size KV temporary.
+        staged = resident.view.cache[
+            torch.where(resident_valid, resident_blocks, 0).to(torch.long), offsets
+        ].view(-1, block_size, self.row_width)
+        destinations = torch.arange(
+            num_tokens * padded_width,
+            dtype=torch.int32,
+            device=logical_indices.device,
+        ).view(num_tokens, padded_width)
+        torch.ops._C_cache_ops.hisparse_gather_plan(
+            self.host_cache,
+            staged,
+            torch.where(source_valid, source_rows, -1).to(torch.int32),
+            destinations,
+            (source_valid & ~resident_valid).to(torch.int32),
+            None,
+            None,
+            0,
+        )
+        physical_indices = destinations[:, :width].masked_fill(
+            ~(source_valid | resident_valid)[:, :width], -1
+        )
+        return staged, physical_indices
+
     def reset_hot_state(self) -> None:
         """Drop all hot-buffer bookkeeping (hits become misses)."""
         group = self.index_group
@@ -949,6 +1034,7 @@ class HiSparseRuntime:
         shared_rows: slice,
         attention_indices_out: torch.Tensor | None = None,
         valid_counts_out: torch.Tensor | None = None,
+        num_valid_rows: torch.Tensor | None = None,
     ) -> None:
         """Resolve logical top-k positions and compact rows requiring swaps."""
         num_tokens = topk_indices.shape[0]
@@ -977,8 +1063,7 @@ class HiSparseRuntime:
         swap_device_physical_rows = shared.swap_device_physical_rows[shared_rows]
         swap_counts = shared.swap_counts[shared_rows]
 
-        # Padded rows are skipped by the kernel (request_state_indices) and must
-        # come out as -1 so the attention kernel masks them.
+        # Rows past num_valid_rows resolve to -1 without touching request state.
         torch.ops._C_cache_ops.hisparse_resolve_residency(
             host_cache,
             hot.cache,
@@ -1007,6 +1092,7 @@ class HiSparseRuntime:
             if resident is not None and resident.view is not None
             else 0,
             0,
+            num_valid_rows,
         )
 
     def _swap_rows(self, shared_rows: slice) -> None:
@@ -1041,17 +1127,9 @@ class HiSparseRuntime:
         else:
             group.copy_stream.wait_stream(compute_stream)
         with group.copy_stream:
-            # CUDA-graph padding rows past the batch's tokens map to request 0;
-            # mark them -1 so residency resolution skips them.
-            num_tokens = logical_topk_indices.shape[0]
-            request_ids = group.request_ids[:num_tokens]
-            request_ids.copy_(req_id_per_token)
-            request_ids.masked_fill_(
-                group.row_indices[:num_tokens] >= num_valid_rows, -1
-            )
             self._resolve_residency(
                 resident=resident,
-                req_id_per_token=request_ids,
+                req_id_per_token=req_id_per_token,
                 block_table=block_table,
                 topk_indices=logical_topk_indices,
                 block_size=block_size,
@@ -1059,6 +1137,7 @@ class HiSparseRuntime:
                 shared_rows=shared_rows,
                 attention_indices_out=attention_indices_out,
                 valid_counts_out=valid_counts_out,
+                num_valid_rows=num_valid_rows,
             )
             runtimes = [self]
             if resident.decode_batch:
@@ -1173,6 +1252,111 @@ def update_hisparse_residency(
     residency[state_rows, :, values[:, 1]] = values[:, 2:]
 
 
+class HiSparseSlotInvalidator:
+    """Batch invalidation with a per-leader fallback for incompatible layouts.
+
+    Bind pointer owners once, never the dynamic slot values.
+    """
+
+    def __init__(
+        self,
+        request_state_indices: torch.Tensor,
+        leaders: Sequence[HiSparseRuntime],
+    ) -> None:
+        self.request_state_indices = request_state_indices
+        self._leaders = tuple(leaders)
+        self._tables: tuple[torch.Tensor, ...] = ()
+        self._table_ptrs: torch.Tensor | None = None
+        self._op = getattr(
+            torch.ops._C_cache_ops, "hisparse_invalidate_written_slots_batch", None
+        )
+        if (
+            self._op is None
+            or not leaders
+            or not request_state_indices.is_cuda
+            or request_state_indices.dtype != torch.int32
+            or request_state_indices.ndim != 1
+            or not request_state_indices.is_contiguous()
+        ):
+            return
+        tables = tuple(leader.index_group.device_global_indices for leader in leaders)
+        first = tables[0]
+        if len(tables) > 65535 or any(
+            table.device != request_state_indices.device
+            or table.dtype != torch.int32
+            or table.ndim != 2
+            or not table.is_contiguous()
+            or table.shape != first.shape
+            for table in tables
+        ):
+            return
+        self._tables = tables
+        self._signatures = tuple(self._signature(table) for table in tables)
+        self._table_ptrs = torch.tensor(
+            [signature[0] for signature in self._signatures],
+            dtype=torch.int64,
+            device=request_state_indices.device,
+        )
+
+    @staticmethod
+    def _signature(table: torch.Tensor) -> tuple:
+        return table.data_ptr(), table.shape, table.stride(), table.dtype, table.device
+
+    def __call__(
+        self,
+        leaders: Sequence[HiSparseRuntime],
+        written_slots: torch.Tensor,
+        req_id_per_token: torch.Tensor,
+        *,
+        allow_batch: bool = True,
+    ) -> bool:
+        """Invalidate every leader; return whether the optional batch path ran."""
+        num_tokens = min(written_slots.numel(), req_id_per_token.numel())
+        if not leaders or not num_tokens:
+            return False
+        can_batch = (
+            allow_batch
+            and self._table_ptrs is not None
+            and len(leaders) == len(self._leaders)
+            and all(left is right for left, right in zip(leaders, self._leaders))
+            and all(
+                leader.request_state_indices is self.request_state_indices
+                and leader.index_group.device_global_indices is table
+                and self._signature(table) == signature
+                for leader, table, signature in zip(
+                    leaders, self._tables, self._signatures
+                )
+            )
+            and self.request_state_indices.is_cuda
+            and self.request_state_indices.dtype == torch.int32
+            and self.request_state_indices.ndim == 1
+            and self.request_state_indices.is_contiguous()
+            and all(
+                tensor.device == self.request_state_indices.device
+                and tensor.dtype == dtype
+                and tensor.ndim == 1
+                and tensor.is_contiguous()
+                for tensor, dtype in (
+                    (written_slots, torch.int64),
+                    (req_id_per_token, torch.int32),
+                )
+            )
+        )
+        if can_batch:
+            assert self._op is not None
+            self._op(
+                self._table_ptrs,
+                self.request_state_indices,
+                req_id_per_token[:num_tokens],
+                written_slots[:num_tokens],
+                *self._tables[0].shape,
+            )
+            return True
+        for leader in leaders:
+            leader.invalidate_written_slots(written_slots, req_id_per_token)
+        return False
+
+
 class HiSparseCacheHandle:
     """Attention-facing handle for resident KV and sparse offload state."""
 
@@ -1243,8 +1427,11 @@ class HiSparseCacheHandle:
     def finish_kv_update(self) -> None:
         if self.dummy_batch:
             return
+        from vllm.distributed.kv_transfer import has_kv_transfer_group
+
         if (
             self.submit_layer_mirror is not None
+            and has_kv_transfer_group()
             and not self.decode_batch
             and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
         ):

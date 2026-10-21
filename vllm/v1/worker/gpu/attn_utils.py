@@ -39,6 +39,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.ubatch_utils import get_num_ubatches
 from vllm.v1.worker.utils import (
     AttentionGroup,
+    _MambaMetadataReuseKey,
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
     bind_kv_cache_to_layers,
@@ -285,6 +286,7 @@ def init_attn_backend(
                     )
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None
+    mamba_reuse_keys: dict[tuple[MambaSpec, type], _MambaMetadataReuseKey] = {}
     for kv_cache_group_id, groups in enumerate(attn_groups):
         kernel_block_size: int | None = None
         if kv_cache_group_id < len(kernel_block_sizes):
@@ -299,6 +301,17 @@ def init_attn_backend(
                 # it on the prefill backend), so each ubatch needs its own.
                 num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
             )
+            builder = group.get_metadata_builder(0)
+            if builder.supports_update_block_table and isinstance(
+                group.kv_cache_spec, MambaSpec
+            ):
+                reuse_key = (group.kv_cache_spec, type(builder))
+                if reuse_key not in mamba_reuse_keys:
+                    mamba_reuse_keys[reuse_key] = _MambaMetadataReuseKey(*reuse_key)
+                group._mamba_metadata_reuse_key = (
+                    group.kv_cache_spec,
+                    mamba_reuse_keys[reuse_key],
+                )
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
             # buffer is written serially, as it already is across steps.
@@ -446,7 +459,7 @@ def init_kv_cache(
 
 
 def build_slot_mappings_by_layer(
-    slot_mappings: torch.Tensor, kv_cache_config: KVCacheConfig
+    slot_mappings: torch.Tensor | Sequence[torch.Tensor], kv_cache_config: KVCacheConfig
 ) -> dict[str, torch.Tensor]:
     slot_mappings_by_layer: dict[str, torch.Tensor] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
@@ -466,7 +479,7 @@ def build_attn_metadata(
     seq_lens: torch.Tensor,
     max_seq_len: int,
     block_tables: Sequence[torch.Tensor],
-    slot_mappings: torch.Tensor,
+    slot_mappings: torch.Tensor | Sequence[torch.Tensor],
     kv_cache_config: KVCacheConfig,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     dcp_local_seq_lens: torch.Tensor | None = None,
@@ -497,89 +510,105 @@ def build_attn_metadata(
     # Mamba groups with the same spec and builder differ only in their state
     # indices, so later groups re-gather those from the first group's metadata.
     # Also at capture, so FULL graphs share the batch-level buffers.
-    cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
+    cached_metadata: dict[object, Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
             continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
-        # Per-group causal for hybrid drafters (mixed SWA/full attention).
-        group_causal = (
-            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
-        )
-
-        common_attn_metadata_extra_kwargs = (
-            model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
-            if model_specific_attn_metadata is not None
-            else {}
-        )
-        # Model-specific metadata (e.g. Mamba hybrid) may supply its own
-        # padding-aware is_prefilling, which takes precedence over the default.
-        group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
-            "is_prefilling", is_prefilling
-        )
-        if fast_prefill is not None:
-            common_attn_metadata_extra_kwargs.update(
-                logits_indices_padded=fast_prefill.logits_indices_padded,
-                num_logits_indices=fast_prefill.num_logits_indices,
-                max_logits_per_req=fast_prefill.max_logits_per_req,
-            )
-        common_attn_metadata = CommonAttentionMetadata(
-            query_start_loc=query_start_loc_gpu,
-            query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=seq_lens,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            max_seq_len=max_seq_len,
-            num_reqs=num_reqs,
-            num_actual_tokens=num_tokens,
-            max_query_len=max_query_len,
-            block_table_tensor=block_table,
-            slot_mapping=slot_mapping,
-            causal=group_causal,
-            dcp_local_seq_lens=dcp_local_seq_lens,
-            dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
-            positions=positions,
-            is_prefilling=group_is_prefilling,
-            mm_req_doc_ranges=mm_req_doc_ranges,
-            rswa_prefix_lens=rswa_prefix_lens,
-            req_idx=req_idx,
-            _token_to_req_indices_cache=token_to_req_indices,
-            **common_attn_metadata_extra_kwargs,
-        )
+        common_attn_metadata = None
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            reuse_key = None
+            reuse_key: object | None = None
             if attn_metadata_builder.supports_update_block_table and isinstance(
                 attn_group.kv_cache_spec, MambaSpec
             ):
-                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+                prepared = getattr(attn_group, "_mamba_metadata_reuse_key", None)
+                if (
+                    prepared is not None
+                    and prepared[0] is attn_group.kv_cache_spec
+                    and prepared[1].builder_cls is type(attn_metadata_builder)
+                ):
+                    reuse_key = prepared[1]
+                else:
+                    reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
             if reuse_key in cached_metadata:
                 metadata = attn_metadata_builder.update_block_table(
                     cached_metadata[reuse_key], block_table, slot_mapping
                 )
-            elif for_cudagraph_capture:
-                metadata = attn_group.build_metadata_for_cudagraph_capture(
-                    common_attn_metadata, ubatch_idx
-                )
             else:
-                attn_metadata_extra_kwargs = (
-                    model_specific_attn_metadata.get_extra_attn_kwargs(
-                        attn_metadata_builder,
-                        num_reqs,
+                if common_attn_metadata is None:
+                    # Per-group causal for hybrid drafters (mixed SWA/full attention).
+                    group_causal = (
+                        causal
+                        if isinstance(causal, (bool, torch.Tensor))
+                        else causal.get(i, True)
                     )
-                    if model_specific_attn_metadata is not None
-                    else {}
-                )
-                metadata = attn_group.build_metadata(
-                    common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs
-                )
+
+                    common_attn_metadata_extra_kwargs = (
+                        model_specific_attn_metadata.get_extra_common_attn_kwargs(
+                            i, num_reqs
+                        )
+                        if model_specific_attn_metadata is not None
+                        else {}
+                    )
+                    # Model-specific metadata may supply padding-aware
+                    # is_prefilling, which takes precedence over the default.
+                    group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
+                        "is_prefilling", is_prefilling
+                    )
+                    if fast_prefill is not None:
+                        common_attn_metadata_extra_kwargs.update(
+                            logits_indices_padded=fast_prefill.logits_indices_padded,
+                            num_logits_indices=fast_prefill.num_logits_indices,
+                            max_logits_per_req=fast_prefill.max_logits_per_req,
+                        )
+                    common_attn_metadata = CommonAttentionMetadata(
+                        query_start_loc=query_start_loc_gpu,
+                        query_start_loc_cpu=query_start_loc_cpu,
+                        seq_lens=seq_lens,
+                        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                        max_seq_len=max_seq_len,
+                        num_reqs=num_reqs,
+                        num_actual_tokens=num_tokens,
+                        max_query_len=max_query_len,
+                        block_table_tensor=block_table,
+                        slot_mapping=slot_mapping,
+                        causal=group_causal,
+                        dcp_local_seq_lens=dcp_local_seq_lens,
+                        dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+                        positions=positions,
+                        is_prefilling=group_is_prefilling,
+                        mm_req_doc_ranges=mm_req_doc_ranges,
+                        rswa_prefix_lens=rswa_prefix_lens,
+                        req_idx=req_idx,
+                        _token_to_req_indices_cache=token_to_req_indices,
+                        **common_attn_metadata_extra_kwargs,
+                    )
+                if for_cudagraph_capture:
+                    metadata = attn_group.build_metadata_for_cudagraph_capture(
+                        common_attn_metadata, ubatch_idx
+                    )
+                else:
+                    attn_metadata_extra_kwargs = (
+                        model_specific_attn_metadata.get_extra_attn_kwargs(
+                            attn_metadata_builder,
+                            num_reqs,
+                        )
+                        if model_specific_attn_metadata is not None
+                        else {}
+                    )
+                    metadata = attn_group.build_metadata(
+                        common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs
+                    )
             if reuse_key is not None and reuse_key not in cached_metadata:
                 cached_metadata[reuse_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
-        token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
+        if common_attn_metadata is not None:
+            token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
 
 

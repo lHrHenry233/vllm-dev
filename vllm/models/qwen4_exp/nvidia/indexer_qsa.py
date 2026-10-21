@@ -240,6 +240,9 @@ class QSAIndexer(nn.Module):
         attn: "Qwen4ExpQSAAttention",
         qkv: torch.Tensor | None = None,
         slot_mapping: torch.Tensor | None = None,
+        main_kv_cache: torch.Tensor | None = None,
+        main_kv_outputs: tuple[torch.Tensor, torch.Tensor] | None = None,
+        main_mirror: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Update side caches and select token indices from pre-projected Q/K.
 
@@ -250,7 +253,7 @@ class QSAIndexer(nn.Module):
         index).
 
         With ``attn.use_fused_qsa_prepare``, the same launch also writes
-        ``attn``'s K/V into ``attn.kv_cache`` at ``slot_mapping`` and prepares
+        ``attn``'s K/V into the given cache (default ``attn.kv_cache``) and prepares
         its Q and gate from ``qkv``, returned as the second element (None
         otherwise). ``qkv`` and ``slot_mapping`` are only read in that mode.
         """
@@ -304,9 +307,15 @@ class QSAIndexer(nn.Module):
                 self.index_head_dim,
                 dtype=self.indexer_dtype,
             )
-            main_kv_cache = attn.kv_cache.transpose(1, 2)
+            if main_kv_cache is None:
+                main_kv_cache = attn.kv_cache.transpose(1, 2)
             if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
                 main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+                if main_mirror is not None:
+                    main_mirror = (
+                        main_mirror[0].view(torch.float8_e4m3fn),
+                        main_mirror[1],
+                    )
             main_outputs = qsa_prepare(
                 projected_q,
                 raw_keys,
@@ -339,6 +348,13 @@ class QSAIndexer(nn.Module):
                 main_slot_mapping=slot_mapping[:num_tokens],
                 main_k_scale=attn._k_scale_float,
                 main_v_scale=attn._v_scale_float,
+                main_k_out=main_kv_outputs[0] if main_kv_outputs is not None else None,
+                main_v_out=main_kv_outputs[1] if main_kv_outputs is not None else None,
+                write_main_cache=(
+                    main_kv_outputs is None or attn.fused_qsa_cache_write
+                ),
+                main_mirror_cache=main_mirror[0] if main_mirror is not None else None,
+                main_mirror_slots=main_mirror[1] if main_mirror is not None else None,
             )
         else:
             # Unfused reference path

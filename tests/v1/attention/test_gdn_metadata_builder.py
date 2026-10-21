@@ -5,7 +5,7 @@ reclassification of non-spec decodes as prefills when spec decodes exist.
 Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import pytest
 import torch
@@ -17,6 +17,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
@@ -150,12 +151,18 @@ GDN_BUILD_TEST_CASES = {
 def _create_gdn_builder(
     num_speculative_tokens: int = 0,
     full_cuda_graph: bool = False,
+    *,
+    mamba_cache_mode: str = "none",
+    kv_cache_spec: MambaSpec | None = None,
+    device: torch.device = DEVICE,
+    model_name: str = "Qwen/Qwen3.5-0.8B",
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(
-        model_name="Qwen/Qwen3.5-0.8B",
+        model_name=model_name,
         block_size=BLOCK_SIZE,
     )
+    vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
     vllm_config.compilation_config.cudagraph_mode = (
         CUDAGraphMode.FULL_AND_PIECEWISE if full_cuda_graph else CUDAGraphMode.NONE
     )
@@ -164,7 +171,7 @@ def _create_gdn_builder(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
         )
-    mamba_spec = MambaSpec(
+    mamba_spec = kv_cache_spec or MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
         dtypes=(torch.float16,),
@@ -173,8 +180,25 @@ def _create_gdn_builder(
         kv_cache_spec=mamba_spec,
         layer_names=["layer.0"],
         vllm_config=vllm_config,
-        device=DEVICE,
+        device=device,
     )
+
+
+@pytest.fixture
+def gdn_model_name(tmp_path):
+    from transformers import Qwen3Config
+
+    Qwen3Config(
+        architectures=["Qwen3ForCausalLM"],
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=8,
+        vocab_size=32,
+    ).save_pretrained(tmp_path)
+    return str(tmp_path)
 
 
 def _build(
@@ -226,11 +250,13 @@ def test_update_block_table_matches_build(
     """update_block_table() on another group's metadata matches build()."""
     batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
     src, dst, ref = (
-        _create_gdn_builder(test_case.num_speculative_tokens, full_cuda_graph)
+        _create_gdn_builder(
+            test_case.num_speculative_tokens,
+            full_cuda_graph,
+            mamba_cache_mode=mamba_cache_mode,
+        )
         for _ in range(3)
     )
-    for builder in (src, dst, ref):
-        builder.vllm_config.cache_config.mamba_cache_mode = mamba_cache_mode
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
     if mamba_cache_mode == "align":
         # MRV2 precomputes these for every Mamba group each step.
@@ -242,18 +268,25 @@ def test_update_block_table_matches_build(
     draft_tokens = test_case.num_decode_draft_tokens
     expected = _build(ref, batch, draft_tokens, common.block_table_tensor)
     source = _build(src, batch, draft_tokens)
-    fields = (
+    state_fields = (
         "spec_state_indices_tensor",
         "non_spec_state_indices_tensor",
         "prefill_state_indices",
     )
-    source_indices = [getattr(source, f) for f in fields]
+    source_indices = [getattr(source, f) for f in state_fields]
     source_indices = [t if t is None else t.clone() for t in source_indices]
     meta = dst.update_block_table(
         source, common.block_table_tensor, common.slot_mapping
     )
 
-    for field, source_index in zip(fields, source_indices):
+    group_fields = {*state_fields, "checkpoint"}
+    for metadata_field in fields(meta):
+        if metadata_field.name not in group_fields:
+            assert getattr(meta, metadata_field.name) is getattr(
+                source, metadata_field.name
+            )
+
+    for field, source_index in zip(state_fields, source_indices):
         actual = getattr(meta, field)
         torch.testing.assert_close(actual, getattr(expected, field))
         # The source group's indices are untouched.
@@ -261,6 +294,202 @@ def test_update_block_table_matches_build(
         # FULL graph state indices land in this group's own buffers.
         if full_cuda_graph and meta.num_prefills == 0 and actual is not None:
             assert actual.data_ptr() == getattr(dst, field).data_ptr()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("state_slots", [1, 2])
+def test_aligned_full_decode_reuses_live_group_indices(
+    state_slots, monkeypatch, gdn_model_name
+):
+    """MRV2's persistent indices remain live across padded decode batches."""
+    from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    device = torch.device("cuda")
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((16, 64),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=state_slots - 1,
+    )
+    src, dst, ref = (
+        _create_gdn_builder(
+            full_cuda_graph=True,
+            mamba_cache_mode="align",
+            kv_cache_spec=spec,
+            device=device,
+            model_name=gdn_model_name,
+        )
+        for _ in range(3)
+    )
+    indices = torch.empty((2, 4, state_slots), dtype=torch.int32, device=device)
+    for group, builder in enumerate((src, dst)):
+        assert builder.supports_update_block_table
+        builder.mamba_aligned_state_indices = indices[group]
+
+    pointers = None
+    for step, num_decodes in enumerate((2, 1, 3)):
+        indices.copy_(
+            torch.arange(indices.numel(), device=device).view_as(indices)
+            + 10
+            + 100 * step
+        )
+        # BlockTables clears padded rows before the aligned-index kernel.
+        indices[:, num_decodes:].fill_(NULL_BLOCK_ID)
+        ref.mamba_aligned_state_indices = indices[1].clone()
+        batch = BatchSpec(
+            seq_lens=[40] * num_decodes + [0] * (4 - num_decodes),
+            query_lens=[1] * num_decodes + [0] * (4 - num_decodes),
+        )
+        common = create_common_attn_metadata(batch, BLOCK_SIZE, device)
+        source = src.build(0, common)
+        actual = dst.update_block_table(
+            source, common.block_table_tensor, common.slot_mapping
+        )
+        expected = ref.build(0, common)
+        for group, metadata in enumerate((source, actual)):
+            value = metadata.non_spec_state_indices_tensor
+            assert value is not None
+            expected_buffer = (
+                indices[group]
+                if state_slots == 1
+                else (src, dst)[group].non_spec_state_indices_tensor
+            )
+            assert value.data_ptr() == expected_buffer.data_ptr()
+            assert value[num_decodes:].tolist() == [NULL_BLOCK_ID] * (4 - num_decodes)
+        torch.testing.assert_close(
+            actual.non_spec_state_indices_tensor, expected.non_spec_state_indices_tensor
+        )
+        source_indices = source.non_spec_state_indices_tensor
+        actual_indices = actual.non_spec_state_indices_tensor
+        assert source_indices is not None
+        assert actual_indices is not None
+        current = (
+            source_indices.data_ptr(),
+            actual_indices.data_ptr(),
+        )
+        assert pointers is None or current == pointers
+        pointers = current
+        assert source_indices[0] != actual_indices[0]
+
+
+@pytest.mark.parametrize("full_cuda_graph", [False, True])
+@pytest.mark.parametrize("state_slots", [1, 2])
+@pytest.mark.parametrize("use_spec_decode", [False, True])
+def test_aligned_update_reuses_live_non_spec_view(
+    full_cuda_graph, state_slots, use_spec_decode, gdn_model_name
+):
+    """Public aligned inputs keep their view while group-local IDs change."""
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((16, 64),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=state_slots - 1,
+    )
+    source_builder, builder = (
+        _create_gdn_builder(
+            int(use_spec_decode),
+            full_cuda_graph,
+            mamba_cache_mode="align",
+            kv_cache_spec=spec,
+            model_name=gdn_model_name,
+        )
+        for _ in range(2)
+    )
+    common = create_common_attn_metadata(
+        BatchSpec([40, 40], [1, 1]), BLOCK_SIZE, DEVICE
+    )
+    source_builder.mamba_aligned_state_indices = torch.tensor(
+        [[91] * state_slots, [92] * state_slots], dtype=torch.int32
+    )
+    source = source_builder.build(0, common)
+    source_indices = source.non_spec_state_indices_tensor
+    assert source_indices is not None
+    original_source = source_indices.clone()
+    backing = torch.tensor([[11] * state_slots, [21] * state_slots], dtype=torch.int32)
+    builder.mamba_aligned_state_indices = backing
+    first = builder.update_block_table(
+        source, common.block_table_tensor, common.slot_mapping
+    )
+    backing.copy_(torch.tensor([[31] * state_slots, [41] * state_slots]))
+    second = builder.update_block_table(
+        source, common.block_table_tensor, common.slot_mapping
+    )
+    first_indices = first.non_spec_state_indices_tensor
+    second_indices = second.non_spec_state_indices_tensor
+    assert first_indices is not None
+    assert second_indices is not None
+    if not full_cuda_graph:
+        assert second_indices is first_indices
+    else:
+        assert (
+            second_indices.data_ptr()
+            == builder.non_spec_state_indices_tensor.data_ptr()
+        )
+    assert second_indices.tolist() == [31, 41]
+    assert second is not first and second is not source
+    torch.testing.assert_close(source.non_spec_state_indices_tensor, original_source)
+
+    short_common = create_common_attn_metadata(BatchSpec([40], [1]), BLOCK_SIZE, DEVICE)
+    source_builder.mamba_aligned_state_indices = torch.tensor(
+        [[93] * state_slots], dtype=torch.int32
+    )
+    short = source_builder.build(0, short_common)
+    builder.mamba_aligned_state_indices = torch.tensor(
+        [[51] * state_slots], dtype=torch.int32
+    )
+    third = builder.update_block_table(
+        short, short_common.block_table_tensor, short_common.slot_mapping
+    )
+    third_indices = third.non_spec_state_indices_tensor
+    first_indices = first.non_spec_state_indices_tensor
+    assert third_indices is not None
+    assert first_indices is not None
+    assert third_indices.tolist() == [51]
+    assert third_indices is not first_indices
+    if not full_cuda_graph:
+        assert first_indices.tolist() == [31, 41]
+
+
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+def test_aligned_update_preserves_mixed_spec_indices(cache_mode, gdn_model_name):
+    """Real mixed metadata preserves masks and independent state gathers."""
+    builder = _create_gdn_builder(
+        num_speculative_tokens=1,
+        full_cuda_graph=True,
+        mamba_cache_mode=cache_mode,
+        model_name=gdn_model_name,
+    )
+    table = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32)
+    common = create_common_attn_metadata(
+        BatchSpec([20, 1], [2, 1]), BLOCK_SIZE, DEVICE
+    ).replace(block_table_tensor=table, is_prefilling=torch.tensor([False, True]))
+    builder.mamba_aligned_state_indices = table
+    source = builder.build(
+        0,
+        common,
+        num_accepted_tokens=torch.ones(2, dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([1, -1], dtype=torch.int32),
+    )
+    assert source.num_prefills == source.num_spec_decodes == 1
+    first = builder.update_block_table(source, table, common.slot_mapping)
+    table.copy_(torch.tensor([[31, 32], [41, 42]], dtype=torch.int32))
+    second = builder.update_block_table(source, table, common.slot_mapping)
+    second_spec_indices = second.spec_state_indices_tensor
+    second_non_spec_indices = second.non_spec_state_indices_tensor
+    second_prefill_indices = second.prefill_state_indices
+    first_spec_indices = first.spec_state_indices_tensor
+    assert second_spec_indices is not None
+    assert second_non_spec_indices is not None
+    assert second_prefill_indices is not None
+    assert first_spec_indices is not None
+    assert second_spec_indices.tolist() == [[31, 32]]
+    assert second_non_spec_indices.tolist() == [41]
+    assert second_prefill_indices.tolist() == [41]
+    assert first_spec_indices.tolist() == [[11, 12]]
+    assert second.spec_sequence_masks_cpu is source.spec_sequence_masks_cpu
 
 
 def test_has_initial_state_after_reclassification():

@@ -1183,6 +1183,170 @@ def test_dilated_ple_spec_state_rolls_back_before_next_forward() -> None:
     torch.testing.assert_close(conv_state[1:], expected_second_state)
 
 
+def _reference_ple_inputs(
+    idx_mapping,
+    num_computed_tokens,
+    all_token_ids,
+    query_start_loc,
+    context,
+    ple_query_start_loc,
+    num_reqs,
+    num_reqs_padded,
+    eos_token_id,
+):
+    # Keep the integer Torch operations replaced in NVIDIA model_state.py.
+    ple_query_start_loc[: num_reqs_padded + 1].copy_(query_start_loc)
+    ple_query_start_loc[num_reqs_padded + 1 :].copy_(query_start_loc[-1])
+    context.fill_(eos_token_id)
+    if num_reqs == 0:
+        return
+    request_indices = idx_mapping[:num_reqs].long()
+    context_end = num_computed_tokens[request_indices].long()
+    offsets = torch.arange(-context.shape[1], 0, device=context.device)
+    token_indices = context_end.unsqueeze(1) + offsets
+    valid_tokens = token_indices >= 0
+    token_indices.clamp_min_(0)
+    context_tokens = all_token_ids[request_indices.unsqueeze(1), token_indices]
+    context[:num_reqs].copy_(
+        torch.where(
+            valid_tokens, context_tokens, context_tokens.new_full((), eos_token_id)
+        )
+    )
+
+
+def _ple_input_view(values, strided):
+    if not strided:
+        return values, values
+    storage = values.new_full(tuple(2 * n + 1 for n in values.shape), -999)
+    view = storage[tuple(slice(1, None, 2) for _ in values.shape)]
+    view.copy_(values)
+    return view, storage
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused PLE needs CUDA")
+@pytest.mark.parametrize(
+    "num_reqs,num_reqs_padded,capacity",
+    [(0, 0, 6), (0, 4, 6), (1, 1, 6), (3, 4, 6), (6, 6, 6), (3, 4, 129)],
+)
+@pytest.mark.parametrize("context_len", [1, 3, 7])
+@pytest.mark.parametrize("strided", [False, True])
+def test_prepare_ple_inputs_matches_torch_with_padding_and_strides(
+    num_reqs, num_reqs_padded, capacity, context_len, strided
+):
+    """Read live request rows and overwrite all padded context/query capacity."""
+    from vllm.models.qwen4_exp.common.ops.ple import prepare_ple_inputs
+
+    device = "cuda"
+    mapping, _ = _ple_input_view(
+        torch.tensor([5, 1, 7, 3, 0, 6], device=device), strided
+    )
+    mapping[num_reqs:].fill_(-999)
+    if num_reqs_padded == 0:
+        mapping = mapping[:0]
+    computed, _ = _ple_input_view(
+        torch.tensor([9, 1, 4, 0, 6, 2, 8, 3], dtype=torch.int32, device=device),
+        strided,
+    )
+    tokens, _ = _ple_input_view(
+        torch.arange(8 * 32, dtype=torch.int32, device=device).view(8, 32), strided
+    )
+    query_lens = [3, 0, 2, 1, 4, 2][:num_reqs] + [0] * (num_reqs_padded - num_reqs)
+    query, _ = _ple_input_view(
+        torch.tensor([0, *accumulate(query_lens)], dtype=torch.int32, device=device),
+        strided,
+    )
+    context, context_storage = _ple_input_view(
+        torch.full((capacity, context_len), -111, dtype=torch.int32, device=device),
+        strided,
+    )
+    query_out, query_storage = _ple_input_view(
+        torch.full((capacity + 1,), -222, dtype=torch.int32, device=device), strided
+    )
+    expected_context, expected_query = context.clone(), query_out.clone()
+    _reference_ple_inputs(
+        mapping,
+        computed,
+        tokens,
+        query,
+        expected_context,
+        expected_query,
+        num_reqs,
+        num_reqs_padded,
+        251,
+    )
+    expected_context_storage = context_storage.clone()
+    expected_query_storage = query_storage.clone()
+    if strided:
+        expected_context_storage[1::2, 1::2].copy_(expected_context)
+        expected_query_storage[1::2].copy_(expected_query)
+    else:
+        expected_context_storage.copy_(expected_context)
+        expected_query_storage.copy_(expected_query)
+
+    prepare_ple_inputs(
+        mapping,
+        computed,
+        tokens,
+        query,
+        context,
+        query_out,
+        num_reqs,
+        num_reqs_padded,
+        251,
+    )
+    torch.testing.assert_close(
+        context_storage, expected_context_storage, rtol=0, atol=0
+    )
+    torch.testing.assert_close(query_storage, expected_query_storage, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused PLE needs CUDA")
+def test_prepare_ple_inputs_graph_replay_reads_rollback_and_live_state():
+    """Replay reads updated device state without replacing captured output buffers."""
+    from vllm.models.qwen4_exp.common.ops.ple import prepare_ple_inputs
+
+    mapping = torch.tensor([5, 1, 7], device="cuda")
+    computed = torch.arange(8, dtype=torch.int32, device="cuda") + 2
+    tokens = torch.arange(8 * 32, dtype=torch.int32, device="cuda").view(8, 32)
+    query = torch.tensor([0, 3, 4, 6, 6], dtype=torch.int32, device="cuda")
+    context = torch.empty((6, 3), dtype=torch.int32, device="cuda")
+    query_out = torch.empty((7,), dtype=torch.int32, device="cuda")
+    args = (mapping, computed, tokens, query, context, query_out, 3, 4, 251)
+    prepare_ple_inputs(*args)
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prepare_ple_inputs(*args)
+    addresses = (context.data_ptr(), query_out.data_ptr())
+    for request_rows, counts, boundaries in [
+        ([7, 0, 3], [0, 1, 4, 2, 8, 1, 5, 3], [0, 1, 1, 5, 5]),
+        ([1, 5, 7], [9, 8, 3, 0, 1, 12, 7, 4], [0, 2, 5, 6, 6]),
+    ]:
+        mapping.copy_(torch.tensor(request_rows, device="cuda"))
+        computed.copy_(torch.tensor(counts, dtype=torch.int32, device="cuda"))
+        query.copy_(torch.tensor(boundaries, dtype=torch.int32, device="cuda"))
+        tokens.add_(37)
+        graph.replay()
+        expected_context, expected_query = (
+            torch.empty_like(context),
+            torch.empty_like(query_out),
+        )
+        _reference_ple_inputs(
+            mapping,
+            computed,
+            tokens,
+            query,
+            expected_context,
+            expected_query,
+            3,
+            4,
+            251,
+        )
+        torch.testing.assert_close(context, expected_context, rtol=0, atol=0)
+        torch.testing.assert_close(query_out, expected_query, rtol=0, atol=0)
+        assert (context.data_ptr(), query_out.data_ptr()) == addresses
+
+
 def _reference_ngram_ids(
     input_ids: torch.Tensor,
     query_start_loc: torch.Tensor,

@@ -19,6 +19,105 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
+@triton.jit(do_not_specialize=["num_reqs", "num_reqs_padded"])
+def _prepare_ple_inputs_kernel(
+    idx_mapping_ptr,
+    num_computed_tokens_ptr,
+    all_token_ids_ptr,
+    query_start_loc_ptr,
+    context_ptr,
+    ple_query_start_loc_ptr,
+    num_reqs,
+    num_reqs_padded,
+    eos_token_id: tl.constexpr,
+    MAPPING_STRIDE: tl.constexpr,
+    COMPUTED_STRIDE: tl.constexpr,
+    TOKEN_ROW_STRIDE: tl.constexpr,
+    TOKEN_COL_STRIDE: tl.constexpr,
+    QUERY_STRIDE: tl.constexpr,
+    CONTEXT_ROW_STRIDE: tl.constexpr,
+    CONTEXT_COL_STRIDE: tl.constexpr,
+    PLE_QUERY_STRIDE: tl.constexpr,
+    CONTEXT_LEN: tl.constexpr,
+    CONTEXT_NUMEL: tl.constexpr,
+    QUERY_NUMEL: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    index = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    row = index // CONTEXT_LEN
+    col = index % CONTEXT_LEN
+    context_mask = index < CONTEXT_NUMEL
+    active = context_mask & (row < num_reqs)
+    request = tl.load(idx_mapping_ptr + row * MAPPING_STRIDE, active, other=0).to(
+        tl.int64
+    )
+    context_end = tl.load(
+        num_computed_tokens_ptr + request * COMPUTED_STRIDE, active, other=0
+    ).to(tl.int64)
+    token_index = context_end - CONTEXT_LEN + col
+    token = tl.load(
+        all_token_ids_ptr
+        + request * TOKEN_ROW_STRIDE
+        + tl.maximum(token_index, 0) * TOKEN_COL_STRIDE,
+        active & (token_index >= 0),
+        other=eos_token_id,
+    )
+    tl.store(
+        context_ptr + row * CONTEXT_ROW_STRIDE + col * CONTEXT_COL_STRIDE,
+        token,
+        context_mask,
+    )
+
+    query_mask = index < QUERY_NUMEL
+    query_index = tl.minimum(index, num_reqs_padded)
+    query_start = tl.load(
+        query_start_loc_ptr + query_index * QUERY_STRIDE, query_mask, other=0
+    )
+    tl.store(
+        ple_query_start_loc_ptr + index * PLE_QUERY_STRIDE, query_start, query_mask
+    )
+
+
+def prepare_ple_inputs(
+    idx_mapping: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    all_token_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    ple_query_start_loc: torch.Tensor,
+    num_reqs: int,
+    num_reqs_padded: int,
+    eos_token_id: int,
+) -> None:
+    """Update persistent PLE context and padded query boundaries from live state."""
+    block_size = 256
+    numel = max(ngram_context.numel(), ple_query_start_loc.numel())
+    _prepare_ple_inputs_kernel[(triton.cdiv(numel, block_size),)](
+        idx_mapping,
+        num_computed_tokens,
+        all_token_ids,
+        query_start_loc,
+        ngram_context,
+        ple_query_start_loc,
+        num_reqs,
+        num_reqs_padded,
+        eos_token_id,
+        idx_mapping.stride(0),
+        num_computed_tokens.stride(0),
+        all_token_ids.stride(0),
+        all_token_ids.stride(1),
+        query_start_loc.stride(0),
+        ngram_context.stride(0),
+        ngram_context.stride(1),
+        ple_query_start_loc.stride(0),
+        ngram_context.shape[1],
+        ngram_context.numel(),
+        ple_query_start_loc.numel(),
+        block_size,
+        num_warps=4,
+    )
+
+
 # N-gram ID generation
 @triton.jit(do_not_specialize=["num_tokens", "num_reqs", "binary_search_iters"])
 def _ple_ngram_ids_kernel(

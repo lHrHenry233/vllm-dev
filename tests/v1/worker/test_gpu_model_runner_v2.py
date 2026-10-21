@@ -11,8 +11,10 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from tests.utils import spawn_new_process_for_each_test
 from vllm.config import CacheConfig, LoRAConfig, ParallelConfig
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -299,6 +301,7 @@ def _make_capture_runner(
     runner.block_tables = None
     runner.attn_groups = None
     runner.kv_cache_config = None
+    runner.max_num_tokens = 2
     runner.use_aux_hidden_state_outputs = False
     runner.kv_connector = model_runner_module.NO_OP_KV_CONNECTOR
     return runner
@@ -359,6 +362,299 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="HiSparse requires NVIDIA CUDA"
+)
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("nested_warmup", [False, True])
+@spawn_new_process_for_each_test
+def test_capture_model_does_not_consume_hisparse_mirror_phase(
+    monkeypatch, tmp_path, vllm_runner, fail, nested_warmup
+):
+    """Real capture/dummy runs leave one live prefill mirror phase available."""
+    import json
+
+    from transformers import DeepseekV3Config
+
+    from vllm.config import (
+        AttentionConfig,
+        CUDAGraphMode,
+        HiSparseConfig,
+        KVTransferConfig,
+    )
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
+        HiSparseConnector,
+    )
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
+        HiSparseConnectorWorker,
+    )
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.engine.core_client import InprocClient
+    from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+    from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
+
+    capability = current_platform.get_device_capability()
+    if capability is None or capability.major < 9:
+        pytest.skip("Sparse MLA requires Hopper or newer")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_DEEP_GEMM_WARMUP", "skip")
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+
+    # Same small MLA shape as the HiSparse E2E suite, with a local config and
+    # dummy weights: no tokenizer, checkpoint or remote model is required.
+    config = DeepseekV3Config(
+        architectures=["DeepseekV32ForCausalLM"],
+        num_hidden_layers=8,
+        hidden_size=256,
+        intermediate_size=512,
+        num_attention_heads=8,
+        num_key_value_heads=1,
+        n_routed_experts=8,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        first_k_dense_replace=3,
+        moe_intermediate_size=2048,
+        n_group=8,
+        topk_group=4,
+        topk_method="noaux_tc",
+        scoring_func="sigmoid",
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=128,
+        vocab_size=128,
+        max_position_embeddings=163840,
+        rope_scaling={
+            "type": "yarn",
+            "factor": 40,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+        },
+        bos_token_id=0,
+        eos_token_id=1,
+        torch_dtype="bfloat16",
+    ).to_dict()
+    config["model_type"] = "deepseek_v32"
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    retained_graph_owners: list[object] = []
+    with (
+        contextlib.ExitStack() as graph_lifetime,
+        vllm_runner(
+            str(tmp_path),
+            load_format="dummy",
+            skip_tokenizer_init=True,
+            dtype="bfloat16",
+            seed=7,
+            max_model_len=64,
+            max_num_batched_tokens=8,
+            max_num_seqs=1,
+            block_size=64,
+            num_gpu_blocks_override=128,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+            async_scheduling=False,
+            attention_config=AttentionConfig(
+                hisparse_config=HiSparseConfig(device_buffer_size=512)
+            ),
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="HiSparseConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config={"host_pool_gib": 1 / 64},
+            ),
+            compilation_config={
+                "mode": 0,
+                "cudagraph_mode": "FULL_AND_PIECEWISE",
+                "cudagraph_capture_sizes": [1, 2],
+            },
+        ) as engine,
+    ):
+        client = engine.llm.llm_engine.engine_core
+        assert isinstance(client, InprocClient)
+        runner = client.engine_core.model_executor.driver_worker.worker.model_runner
+        assert isinstance(runner, GPUModelRunner)
+        connector = runner.kv_connector
+        assert isinstance(connector, ActiveKVConnector)
+        assert isinstance(connector.kv_connector, HiSparseConnector)
+        connector_worker = connector.kv_connector.connector_worker
+        assert isinstance(connector_worker, HiSparseConnectorWorker)
+        worker: HiSparseConnectorWorker = connector_worker
+        assert worker.cache_handles
+        cudagraph_manager = runner.cudagraph_manager
+        assert isinstance(cudagraph_manager, ModelCudaGraphManager)
+        manager: ModelCudaGraphManager = cudagraph_manager
+        # ExitStack closes after the engine, including when an assertion fails.
+        graph_lifetime.callback(retained_graph_owners.clear)
+        graph_lifetime.callback(torch.accelerator.synchronize)
+
+        def release_graphs_with_live_pool_owners():
+            # Reuse the real pool without destroying its last captured owner.
+            # Breakable captures own their CUDAGraph segments via bound replay.
+            retained_graph_owners.extend(manager.graphs.values())
+            breakable_runner = manager.breakable_cg_runner
+            assert breakable_runner is not None
+            retained_graph_owners.extend(
+                entry.capture
+                for entry in breakable_runner.entries.values()
+                if entry.capture is not None
+            )
+            manager.release_graphs()
+
+        assert manager.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
+        assert manager.use_breakable_cg
+        assert manager.captured_token_counts()
+        torch.accelerator.synchronize()
+        host_before = [
+            cache.runtime.host_cache.view(torch.uint8).clone()
+            for cache in worker.cache_handles
+        ]
+        completion_before = worker.host_write_event
+
+        def assert_mirror_phase_unused():
+            torch.accelerator.synchronize()
+            breakable_runner = manager.breakable_cg_runner
+            assert breakable_runner is not None
+            assert breakable_runner.entries
+            assert all(
+                entry.capture is not None for entry in breakable_runner.entries.values()
+            )
+            assert not worker._per_layer_mirrored
+            assert not worker._submitted_mirror_layers
+            assert worker.host_write_event is completion_before
+            for cache, expected in zip(worker.cache_handles, host_before):
+                assert torch.equal(cache.runtime.host_cache.view(torch.uint8), expected)
+
+        # Public release removes startup graphs from dispatch. Keep their real
+        # owners alive locally while recapturing into the same Torch pool.
+        release_graphs_with_live_pool_owners()
+        outer = connector.disabled() if nested_warmup else contextlib.nullcontext()
+        with outer:
+            if nested_warmup:
+                runner._dummy_run(2, skip_eplb=True)
+                assert not has_kv_transfer_group()
+            runner.capture_model(profile_only=True)
+            assert manager.captured_token_counts()
+            assert has_kv_transfer_group() is not nested_warmup
+            if fail:
+                with pytest.raises(AssertionError, match="Graph already captured"):
+                    runner.capture_model(profile_only=True)
+                assert has_kv_transfer_group() is not nested_warmup
+            if nested_warmup:
+                runner._dummy_run(2, skip_eplb=True)
+                assert not has_kv_transfer_group()
+            assert_mirror_phase_unused()
+        assert get_kv_transfer_group() is connector.kv_connector
+        if fail:
+            release_graphs_with_live_pool_owners()
+            runner.capture_model(profile_only=True)
+            assert manager.captured_token_counts()
+        assert_mirror_phase_unused()
+        assert get_kv_transfer_group() is connector.kv_connector
+
+        # Three prompt tokens exceed the PW capture sizes, so this is a real
+        # non-decode prefill, rather than a replay or a synthetic handle call.
+        class MirrorPhaseObservation:
+            observed = False
+            per_layer_mirrored: set[int] | None = None
+            submitted_mirror_layers: set[int] | None = None
+            completion_event: torch.Event | None = None
+            rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
+
+            def __call__(self, module, inputs, model_output):
+                available = is_forward_context_available()
+                context = get_forward_context() if available else None
+                details = {
+                    "forward_context_available": available,
+                    "mode": None if context is None else context.cudagraph_runtime_mode,
+                    "mirrored": sorted(worker._per_layer_mirrored),
+                    "submitted": sorted(worker._submitted_mirror_layers),
+                    "active_tokens": [
+                        c.num_actual_tokens for c in worker.cache_handles
+                    ],
+                    "decode_batch": [c.decode_batch for c in worker.cache_handles],
+                }
+                assert not self.observed, details
+                assert available, details
+                assert context is not None, details
+                assert context.cudagraph_runtime_mode == CUDAGraphMode.NONE, details
+                self.observed = True
+                self.per_layer_mirrored = set(worker._per_layer_mirrored)
+                self.submitted_mirror_layers = set(worker._submitted_mirror_layers)
+                # This model uses finish_forward's supported whole-step mirror.
+                # QSA reference cases exercise the real per-layer duplicate guard.
+                assert worker._per_layer_mirrored == set(), details
+                assert worker._submitted_mirror_layers == set(), details
+                self.completion_event = worker.host_write_event
+                self.rows = []
+                for cache in worker.cache_handles:
+                    assert not cache.decode_batch and cache.num_actual_tokens == 3, (
+                        details
+                    )
+                    slot_mapping = cache.slot_mapping
+                    mirror_slot_mapping = cache.mirror_slot_mapping
+                    cache_view = cache.view
+                    assert slot_mapping is not None, details
+                    assert mirror_slot_mapping is not None, details
+                    assert cache_view is not None, details
+                    slots = slot_mapping[:3].clone()
+                    destinations = mirror_slot_mapping[:3].clone()
+                    rows = cache_view.cache[
+                        slots // worker.kernel_block_size,
+                        slots % worker.kernel_block_size,
+                    ].clone()
+                    self.rows.append((slots, destinations, rows))
+                # A public forward hook returning None preserves model_output.
+                return None
+
+        phase = MirrorPhaseObservation()
+        hook = runner.get_model().register_forward_hook(phase)
+        try:
+            outputs = engine.llm.generate(
+                {"prompt_token_ids": [2, 3, 4]},
+                SamplingParams(temperature=0, max_tokens=1, ignore_eos=True),
+                use_tqdm=False,
+            )
+        finally:
+            hook.remove()
+        assert phase.observed
+        assert phase.per_layer_mirrored == set()
+        assert phase.submitted_mirror_layers == set()
+        assert len(outputs) == 1 and len(outputs[0].outputs[0].token_ids) == 1
+        assert phase.completion_event is not None
+        phase.completion_event.synchronize()
+        assert phase.completion_event is not completion_before
+        assert worker.host_write_event is not completion_before
+        assert phase.rows is not None and len(phase.rows) == len(worker.cache_handles)
+        nonzero = False
+        for cache, (slots, destinations, rows) in zip(worker.cache_handles, phase.rows):
+            destinations = destinations.cpu()
+            assert torch.all(slots >= 0) and torch.all(destinations >= 0)
+            rows = rows.cpu()
+            actual = cache.runtime.host_cache[destinations]
+            torch.testing.assert_close(
+                actual.view(torch.uint8), rows.view(torch.uint8), rtol=0, atol=0
+            )
+            nonzero |= bool(torch.count_nonzero(rows).item())
+        assert nonzero
 
 
 @pytest.mark.parametrize("target_buffer", ["absent", "none", "tensor"])

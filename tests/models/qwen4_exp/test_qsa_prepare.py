@@ -92,7 +92,9 @@ def _make_main_inputs(num_tokens: int, fp8_cache: bool) -> dict:
     )
 
 
-def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
+def _check_main_outputs(
+    main: dict, q_out, gate_out, rope, positions
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Compare with fused_qk_rmsnorm_rope_gate + reshape_and_cache_flash."""
     from vllm._custom_ops import reshape_and_cache_flash
     from vllm.model_executor.layers.fused_qk_norm_rope import (
@@ -121,9 +123,10 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
     fp8_cache = kv_cache.dtype == torch.float8_e4m3fn
     cache = torch.zeros_like(kv_cache.view(torch.uint8) if fp8_cache else kv_cache)
     key_cache, value_cache = cache.split(MAIN_D, dim=-1)
+    rows = main["main_slot_mapping"].numel()
     reshape_and_cache_flash(
-        k.view(-1, MAIN_HK, MAIN_D),
-        v.view(-1, MAIN_HK, MAIN_D),
+        k.view(-1, MAIN_HK, MAIN_D)[:rows],
+        v.view(-1, MAIN_HK, MAIN_D)[:rows],
         key_cache,
         value_cache,
         main["main_slot_mapping"],
@@ -133,15 +136,25 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
     )
     torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
     assert torch.equal(gate_out.flatten(1), gate)
+    if "main_k_out" in main:
+        torch.testing.assert_close(
+            main["main_k_out"].flatten(1), k, rtol=RTOL, atol=ATOL
+        )
+        assert torch.equal(main["main_v_out"].flatten(1), v)
+    if not main.get("write_main_cache", True):
+        assert torch.count_nonzero(kv_cache.float()) == 0
+        return k.view(-1, MAIN_HK, MAIN_D), v.view(-1, MAIN_HK, MAIN_D)
     if fp8_cache:
         assert_fp8_within_one_ulp(kv_cache, cache.view(torch.float8_e4m3fn))
     else:
         torch.testing.assert_close(kv_cache, cache, rtol=RTOL, atol=ATOL)
+    return k.view(-1, MAIN_HK, MAIN_D), v.view(-1, MAIN_HK, MAIN_D)
 
 
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 @pytest.mark.parametrize("indexer_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("main_mode", ["ordinary", "compute", "mirror"])
 @pytest.mark.parametrize(
     "mrope,is_2d_positions,cache_rope_positions,state_size,seq_lens,query_lens,history_lens",
     [
@@ -166,6 +179,7 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
 )
 def test_qsa_fused_prepare_matches_unfused(
     indexer_dtype,
+    main_mode,
     mrope,
     is_2d_positions,
     cache_rope_positions,
@@ -329,6 +343,35 @@ def test_qsa_fused_prepare_matches_unfused(
     fused_query = torch.empty(num_tokens, HQ, D, dtype=indexer_dtype, device=device)
     # The main-attention cache follows the recipe's pairing with the indexer.
     main = _make_main_inputs(num_tokens, indexer_dtype == torch.float8_e4m3fn)
+    mirror_storage = mirror_before = mirror_slots = None
+    if main_mode != "ordinary":
+        main["write_main_cache"] = main_mode == "mirror"
+    if main_mode == "compute":
+        main["main_k_out"] = torch.empty(
+            num_tokens, MAIN_HK, MAIN_D, dtype=torch.bfloat16, device=device
+        )
+        main["main_v_out"] = torch.empty_like(main["main_k_out"])
+    if main_mode == "mirror":
+        # HiSparse may write fewer actual rows than the indexer's padded batch.
+        main["main_slot_mapping"] = main["main_slot_mapping"][:-1]
+        main["main_slot_mapping"][0] = -1
+        resident = main["main_kv_cache"]
+        block_width = MAIN_PAGE * MAIN_HK * 2 * MAIN_D
+        mirror_storage = torch.full(
+            (resident.shape[0], block_width + 32),
+            7,
+            dtype=resident.dtype,
+            device=device,
+        )
+        mirror_before = mirror_storage.clone()
+        main["main_mirror_cache"] = torch.as_strided(
+            mirror_storage,
+            (resident.shape[0], MAIN_PAGE, MAIN_HK, 2 * MAIN_D),
+            (block_width + 32, MAIN_HK * 2 * MAIN_D, 2 * MAIN_D, 1),
+        )
+        mirror_slots = main["main_slot_mapping"].flip(0).clone()
+        mirror_slots[0] = -1
+        main["main_mirror_slots"] = mirror_slots
     main_q_out, main_gate_out = qsa_prepare(
         projected_qk[:, : HQ * D],
         projected_qk[:, HQ * D :],
@@ -351,7 +394,40 @@ def test_qsa_fused_prepare_matches_unfused(
         rope_pos_offset=ROPE_POS_OFFSET if cache_rope_positions else None,
         **main,
     )
-    _check_main_outputs(main, main_q_out, main_gate_out, rope, positions)
+    reference_main_k, reference_main_v = _check_main_outputs(
+        main, main_q_out, main_gate_out, rope, positions
+    )
+    if mirror_storage is not None:
+        from vllm._custom_ops import reshape_and_cache_flash
+
+        assert mirror_before is not None and mirror_slots is not None
+        expected_storage = mirror_before.clone()
+        expected_mirror = torch.as_strided(
+            expected_storage,
+            main["main_mirror_cache"].shape,
+            main["main_mirror_cache"].stride(),
+        )
+        fp8 = expected_mirror.dtype == torch.float8_e4m3fn
+        reference_cache = expected_mirror.view(torch.uint8) if fp8 else expected_mirror
+        reference_k, reference_v = reference_cache.split(MAIN_D, dim=-1)
+        rows = mirror_slots.numel()
+        reshape_and_cache_flash(
+            reference_main_k[:rows],
+            reference_main_v[:rows],
+            reference_k,
+            reference_v,
+            mirror_slots,
+            "fp8" if fp8 else "auto",
+            torch.tensor(main["main_k_scale"], device=device),
+            torch.tensor(main["main_v_scale"], device=device),
+        )
+        # Compare physical backing too: padding and unmapped rows must survive.
+        if fp8:
+            assert_fp8_within_one_ulp(mirror_storage, expected_storage)
+        else:
+            torch.testing.assert_close(
+                mirror_storage, expected_storage, rtol=RTOL, atol=ATOL
+            )
 
     unfused_query = projected_qk[:, : HQ * D].reshape(num_tokens, HQ, D)
     unfused_query = gemma_rmsnorm(

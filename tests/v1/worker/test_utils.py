@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
+import ctypes.util
 import mmap
+import threading
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
@@ -15,6 +18,7 @@ import vllm.v1.attention.backends.mla.index_group as index_group_module
 import vllm.v1.hisparse.runtime as hisparse_runtime_module
 from vllm.config import CacheConfig, CUDAGraphMode
 from vllm.config.mamba import MambaBackendEnum, MambaConfig
+from vllm.distributed.kv_transfer import kv_transfer_state
 from vllm.distributed.kv_transfer.kv_connector.v1.hisparse import (
     worker as hisparse_worker_module,
 )
@@ -183,27 +187,72 @@ def test_hisparse_appends_reference_slots_within_a_mirror_phase(monkeypatch):
     assert state.source_index == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA cache binding")
 @pytest.mark.parametrize(
     ("mode", "expected_calls"),
     [(CUDAGraphMode.PIECEWISE, 1), (CUDAGraphMode.FULL, 0)],
 )
 def test_hisparse_submits_layer_mirror_at_replayed_attention_boundary(
-    monkeypatch, mode, expected_calls
+    mode, expected_calls, dist_init
 ):
-    """Piecewise replay must pipeline DMA; FULL replay uses the batch fallback."""
-    handle = object.__new__(hisparse_runtime_module.HiSparseCacheHandle)
-    handle.dummy_batch = False
-    handle.decode_batch = False
-    handle.submit_layer_mirror = MagicMock()
-    monkeypatch.setattr(
-        hisparse_runtime_module,
-        "get_forward_context",
-        lambda: SimpleNamespace(cudagraph_runtime_mode=mode),
+    """Piecewise replay submits real DMA; FULL leaves it for the batch fallback."""
+    from tests.v1.attention.test_sparse_mla_backends import (
+        _bound_hisparse_worker,
+        _hisparse_mirror_metadata,
     )
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
+        HiSparseConnectorMetadata,
+    )
+    from vllm.forward_context import set_forward_context
 
-    handle.finish_kv_update()
-
-    assert handle.submit_layer_mirror.call_count == expected_calls
+    slots = torch.tensor([2, 3], dtype=torch.int64, device="cuda")
+    resident = torch.arange(4 * 4 * 4, dtype=torch.float32, device="cuda").view(4, 4, 4)
+    worker = _bound_hisparse_worker((resident,), slot_mapping=slots)
+    try:
+        kv_transfer_state.ensure_kv_transfer_initialized(
+            worker.vllm_config, worker.kv_cache_config
+        )
+        handle = worker.cache_handles[0]
+        handle.runtime.host_cache.zero_()
+        metadata = _hisparse_mirror_metadata(slots, decode=False)
+        worker.start_step(
+            HiSparseConnectorMetadata(
+                command=None,
+                host_block_copies=(),
+                source_block_ids=(),
+                row_mirrors={"request": (SparseKVRowMirror((2,), 6, 2),)},
+                all_context_pages_resident=True,
+                residency_updates={},
+            ),
+            worker.request_state_indices,
+            ["request"],
+            num_tokens=2,
+        )
+        worker.prepare_forward({"layer.0": metadata})
+        with patch.object(
+            worker, "_enqueue_row_dma", wraps=worker._enqueue_row_dma
+        ) as submit:
+            with set_forward_context(
+                {"layer.0": metadata},
+                worker.vllm_config,
+                num_tokens=2,
+                cudagraph_runtime_mode=mode,
+            ):
+                handle.finish_kv_update()
+            assert submit.call_count == expected_calls
+        if expected_calls:
+            worker.host_write_event.synchronize()
+            torch.testing.assert_close(
+                handle.runtime.host_cache[6:8], resident.view(-1, 4)[2:4].cpu()
+            )
+            assert worker._submitted_mirror_layers == {0}
+        else:
+            assert not worker._dma_submitted
+            assert not worker._submitted_mirror_layers
+            assert torch.count_nonzero(handle.runtime.host_cache).item() == 0
+    finally:
+        worker.shutdown()
+        kv_transfer_state.ensure_kv_transfer_shutdown()
 
 
 def _hisparse_parallel_config(**overrides):
@@ -679,88 +728,286 @@ def test_hisparse_lazy_mirror_copies_transfer_pages(monkeypatch):
     record_transfer_completion.assert_not_called()
 
 
-def test_hisparse_dma_row_mirror_builds_descriptors(monkeypatch):
-    worker = _make_hisparse_worker()
-    worker.is_host_writer = True
-    worker.kernel_block_size = 2
-    source = torch.empty((3, 2, 4), dtype=torch.uint8)
-    destination = torch.empty((6, 4), dtype=torch.uint8)
-    worker.resident_caches = (source,)
-    worker.host_caches = (destination,)
-    worker.cache_handles = _as_cache_handles(
-        SimpleNamespace(
-            runtime=SimpleNamespace(resident_source_index=0), decode_batch=True
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA DMA")
+def test_hisparse_dma_row_mirror_builds_descriptors():
+    from tests.v1.attention.test_sparse_mla_backends import _bound_hisparse_worker
+
+    source = torch.arange(3 * 2 * 16, dtype=torch.uint8, device="cuda").view(3, 2, 16)
+    worker = _bound_hisparse_worker((source,), host_num_rows=6)
+    destination = worker.host_caches[0]
+    try:
+        worker._set_row_mirrors((SparseKVRowMirror((3,), 4, 1),))
+        with patch.object(
+            worker, "_submit_dma_descriptors", wraps=worker._submit_dma_descriptors
+        ) as submit:
+            worker._enqueue_row_dma(range(1))
+            descriptors, count = submit.call_args.args
+            assert count == 1
+            assert descriptors.src[:count].tolist() == [source.data_ptr() + 3 * 16]
+            assert descriptors.dst[:count].tolist() == [destination.data_ptr() + 4 * 16]
+            assert descriptors.sizes[:count].tolist() == [16]
+        assert worker._dma_submitted
+        assert len(worker._pending_dma_descriptors) == 1
+        worker.host_write_event.synchronize()
+        assert worker._pending_dma_descriptors[0][0].query()
+        torch.testing.assert_close(destination[4], source.view(-1, 16)[3].cpu())
+    finally:
+        worker.shutdown()
+
+
+def _dma_host_gate(stream):
+    """Block a real CUDA stream at a host callback until the test releases it."""
+    release, entered, expired = threading.Event(), threading.Event(), threading.Event()
+    callback_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+    @callback_type
+    def callback(_):
+        # A CUDA host callback must not call CUDA APIs, including synchronization.
+        entered.set()
+        if not release.wait(timeout=30):
+            expired.set()
+
+    candidates = (
+        ctypes.util.find_library("cudart"),
+        "libcudart.so.13",
+        "libcudart.so.12",
+    )
+    for name in candidates:
+        if name:
+            try:
+                library = ctypes.CDLL(name)
+                break
+            except OSError:
+                pass
+    else:
+        raise RuntimeError("CUDA runtime library is required for the DMA event gate")
+    launch = library.cudaLaunchHostFunc
+    launch.argtypes = (ctypes.c_void_p, callback_type, ctypes.c_void_p)
+    launch.restype = ctypes.c_int
+    assert launch(ctypes.c_void_p(stream.cuda_stream), callback, None) == 0
+    # The caller retains the callback and library through stream completion.
+    return release, entered, expired, callback, library
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA DMA")
+@pytest.mark.parametrize("layers", [(0, 1, 2), (2, 0), (1,), (2, 2)])
+@pytest.mark.parametrize("rebind", [False, True])
+def test_hisparse_row_dma_uses_resident_spans(layers, rebind):
+    from tests.v1.attention.test_sparse_mla_backends import _bound_hisparse_worker
+    from tests.v1.core.test_kv_cache_planning import _hisparse_planning_config
+    from vllm.config import SpeculativeConfig
+    from vllm.v1.hisparse.runtime import allocate_pinned_host_pool
+
+    sources = (
+        torch.empty((4, 4, 16), dtype=torch.uint8, device="cuda"),
+        torch.empty((4, 4, 8), dtype=torch.float32, device="cuda"),
+        torch.empty_strided(
+            (4, 4, 24), (128, 24, 1), dtype=torch.bfloat16, device="cuda"
+        ),
+    )
+    for index, source in enumerate(sources):
+        source.copy_(
+            torch.arange(source.numel(), device="cuda").view(source.shape) % 97 + index
         )
+    config = _hisparse_planning_config()
+    # Speculative layouts intentionally use per-leader invalidation. This test
+    # exercises DMA only and needs no pointer-table allocation while it is gated.
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=1
     )
-    worker.hot_backing = SimpleNamespace(device=torch.device("cuda:0"))
-    worker.dma_stream = MagicMock()
-    worker.host_write_event = MagicMock()
-    worker._dma_free_descriptors = []
-    worker._pending_dma_descriptors = deque()
-    worker._pending_transfer_events = deque()
-    worker._enqueued_transfer_ids = []
-    worker._dma_submitted = False
-    current_stream = MagicMock()
-    event = MagicMock()
-    swap_blocks_batch = MagicMock()
-    monkeypatch.setattr(
-        hisparse_worker_module, "current_stream", lambda: current_stream
-    )
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(torch, "Event", lambda: event)
-    monkeypatch.setattr(
-        hisparse_worker_module.ops, "swap_blocks_batch", swap_blocks_batch
-    )
-
-    worker._set_row_mirrors((SparseKVRowMirror((3,), 4, 1),))
-    worker._enqueue_row_dma(range(1))
-
-    src_ptrs, dst_ptrs, sizes = swap_blocks_batch.call_args.args
-    assert src_ptrs.tolist() == [source.data_ptr() + 3 * 4]
-    assert dst_ptrs.tolist() == [destination.data_ptr() + 4 * 4]
-    assert sizes.tolist() == [4]
-    worker.dma_stream.wait_stream.assert_called_once_with(current_stream)
-    worker.host_write_event.record.assert_called_once_with(worker.dma_stream)
-    event.record.assert_called_once_with(worker.dma_stream)
-    assert worker._dma_submitted
-
-
-def test_hisparse_row_dma_uses_resident_spans(monkeypatch):
-    worker = _make_hisparse_worker()
-    source = torch.empty((2, 2, 4), dtype=torch.uint8)
-    destination = torch.empty((12, 4), dtype=torch.uint8)
-    worker.is_host_writer = True
-    worker.kernel_block_size = 2
-    worker.resident_caches = (source,)
-    worker.host_caches = (destination,)
-    worker.cache_handles = _as_cache_handles(
-        SimpleNamespace(
-            runtime=SimpleNamespace(resident_source_index=0), decode_batch=True
+    worker = _bound_hisparse_worker(sources, config=config, source_indices=(0, 1, 0))
+    gate = None
+    try:
+        rebound = None
+        old_sources, old_destinations = sources, worker.host_caches
+        if rebind:
+            rebound = (
+                torch.empty_strided(
+                    (5, 4, 16), (80, 16, 1), dtype=torch.uint8, device="cuda"
+                ),
+                torch.empty_strided(
+                    (5, 4, 8), (40, 8, 1), dtype=torch.float32, device="cuda"
+                ),
+                torch.empty_strided(
+                    (5, 4, 24), (160, 24, 1), dtype=torch.bfloat16, device="cuda"
+                ),
+            )
+            new_hosts = []
+            for index, source in enumerate(rebound):
+                source.copy_(
+                    torch.arange(source.numel(), device="cuda").view(source.shape) % 89
+                    + 10
+                    + index
+                )
+                host, registered = allocate_pinned_host_pool(
+                    18 * source.shape[-1] * source.element_size()
+                )
+                worker.pinned_host_pools.append(registered)
+                new_hosts.append(
+                    (host.view(source.dtype).view(18, source.shape[-1]), registered)
+                )
+        # Prime two real submissions and drain them before the gate. The test
+        # does not inject descriptor objects into the worker's private pools.
+        worker._set_row_mirrors(
+            (SparseKVRowMirror((1, 6), 8, 2), SparseKVRowMirror((8, 1), 2, 1))
         )
-    )
-    worker._set_row_mirrors(
-        (
-            SparseKVRowMirror((0,), 4, 2),
-            SparseKVRowMirror((2,), 9, 1),
+        worker._enqueue_row_dma(layers)
+        worker._enqueue_row_dma(layers)
+        worker.host_write_event.synchronize()
+        worker._release_completed_dma_descriptors()
+        assert len(worker._dma_free_descriptors) == 2
+        assert not worker._pending_dma_descriptors
+        for destination in old_destinations:
+            destination.zero_()
+        torch.accelerator.synchronize()
+        if rebind:
+            gate = _dma_host_gate(worker.dma_stream)
+            assert gate[1].wait(timeout=5), "CUDA host callback did not start"
+        worker._set_row_mirrors(
+            (SparseKVRowMirror((1, 6), 8, 2), SparseKVRowMirror((8, 1), 2, 1))
         )
+        with patch.object(
+            worker, "_submit_dma_descriptors", wraps=worker._submit_dma_descriptors
+        ) as submit:
+            worker._enqueue_row_dma(layers)
+            previous, _ = submit.call_args.args
+            previous_src = previous.src.clone()
+            if rebind:
+                pending_event = worker._pending_dma_descriptors[0][0]
+                assert not pending_event.query()
+                assert rebound is not None
+                sources = rebound
+                for handle, source, (destination, registered) in zip(
+                    worker.cache_handles, sources, new_hosts, strict=True
+                ):
+                    raw = torch.empty(0, dtype=torch.uint8, device="cuda").set_(
+                        source.untyped_storage(),
+                        0,
+                        (source.untyped_storage().nbytes(),),
+                        (1,),
+                    )
+                    # KV dtype/row width belong to the real runtime; a legal
+                    # rebind changes storage, block stride and capacity only.
+                    handle.runtime.bind_source_cache(
+                        destination, registered_host_pool=registered
+                    )
+                    handle.bind_cache(
+                        raw,
+                        byte_offset=0,
+                        block_stride=source.stride(0) * source.element_size(),
+                        num_blocks=source.shape[0],
+                        block_size=4,
+                        block_table=handle.block_table,
+                        slot_mapping=handle.slot_mapping,
+                    )
+                worker._init_dma()
+                worker._set_row_mirrors(
+                    (SparseKVRowMirror((1, 6), 8, 2), SparseKVRowMirror((16, 1), 17, 1))
+                )
+                worker._release_completed_dma_descriptors()
+                assert all(
+                    item is not previous for item in worker._dma_free_descriptors
+                )
+                worker._enqueue_row_dma(layers)
+                torch.testing.assert_close(previous.src, previous_src)
+                assert not pending_event.query()
+            descriptors, count = submit.call_args.args
+            assert count == 2 * len(layers)
+            source_rows = ((1, 6, 1), (16, 1, 16) if rebind else (8, 1, 8))
+            destination_rows = (8, 17 if rebind else 2)
+            counts = (2, 1)
+            destinations = worker.host_caches
+            assert descriptors.src[:count].tolist() == [
+                sources[layer].data_ptr()
+                + (row[layer] // 4)
+                * sources[layer].stride(0)
+                * sources[layer].element_size()
+                + (row[layer] % 4)
+                * sources[layer].shape[-1]
+                * sources[layer].element_size()
+                for row in source_rows
+                for layer in layers
+            ]
+            assert descriptors.dst[:count].tolist() == [
+                destinations[layer].data_ptr()
+                + row
+                * destinations[layer].shape[-1]
+                * destinations[layer].element_size()
+                for row in destination_rows
+                for layer in layers
+            ]
+            assert descriptors.sizes[:count].tolist() == [
+                rows * sources[layer].shape[-1] * sources[layer].element_size()
+                for rows in counts
+                for layer in layers
+            ]
+        if gate is not None:
+            gate[0].set()
+        worker.host_write_event.synchronize()
+        worker._release_completed_dma_descriptors()
+        if rebind:
+            assert gate is not None
+            assert pending_event.query()
+            assert any(item is previous for item in worker._dma_free_descriptors)
+            assert not gate[2].is_set(), "CUDA host callback timed out"
+        if rebind:
+            for row, destination, rows in (((1, 6, 1), 8, 2), ((8, 1, 8), 2, 1)):
+                for layer in set(layers):
+                    block, offset = divmod(row[layer], 4)
+                    torch.testing.assert_close(
+                        old_destinations[layer][destination : destination + rows],
+                        old_sources[layer][block, offset : offset + rows].cpu(),
+                    )
+        for mirror_index, row in enumerate(source_rows):
+            for layer in set(layers):
+                block, offset = divmod(row[layer], 4)
+                dest = destination_rows[mirror_index]
+                torch.testing.assert_close(
+                    destinations[layer][dest : dest + counts[mirror_index]],
+                    sources[layer][block, offset : offset + counts[mirror_index]].cpu(),
+                )
+    finally:
+        if gate is not None:
+            gate[0].set()
+        worker.shutdown()
+
+
+@pytest.mark.parametrize(
+    "source_index,source_start,destination_start,count,error",
+    [
+        (1, 0, 0, 1, "source index"),
+        (0, -1, 0, 1, "source is"),
+        (0, 12, 0, 1, "source is"),
+        (0, 3, 0, 2, "source is"),
+        (0, 0, -1, 1, "index is"),
+        (0, 0, 8, 1, "index is"),
+        (0, 0, 7, 2, "index is"),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA DMA")
+def test_hisparse_row_dma_rejects_invalid_span_before_submit(
+    source_index, source_start, destination_start, count, error
+):
+    from tests.v1.attention.test_sparse_mla_backends import _bound_hisparse_worker
+
+    sources = tuple(
+        torch.zeros((3, 4, 4), dtype=torch.float32, device="cuda") for _ in range(2)
     )
-    worker._dma_free_descriptors = []
-    submit_dma_descriptors = MagicMock()
-    monkeypatch.setattr(worker, "_submit_dma_descriptors", submit_dma_descriptors)
-
-    worker._enqueue_row_dma(range(1))
-
-    descriptors, count = submit_dma_descriptors.call_args.args
-    assert count == 2
-    assert descriptors.src[:count].tolist() == [
-        source.data_ptr(),
-        source.data_ptr() + 2 * 4,
-    ]
-    assert descriptors.dst[:count].tolist() == [
-        destination.data_ptr() + 4 * 4,
-        destination.data_ptr() + 9 * 4,
-    ]
-    assert descriptors.sizes[:count].tolist() == [2 * 4, 4]
+    worker = _bound_hisparse_worker(sources, host_num_rows=8)
+    try:
+        worker._set_row_mirrors(
+            (SparseKVRowMirror((source_start,), destination_start, count),)
+        )
+        with patch.object(
+            worker, "_submit_dma_descriptors", wraps=worker._submit_dma_descriptors
+        ) as submit:
+            with pytest.raises(RuntimeError, match=error):
+                worker._enqueue_row_dma((source_index,))
+            submit.assert_not_called()
+        assert not worker._dma_submitted
+        assert not worker._pending_dma_descriptors
+    finally:
+        worker.shutdown()
 
 
 def test_hisparse_finish_forward_mirrors_all_layers_once(monkeypatch):

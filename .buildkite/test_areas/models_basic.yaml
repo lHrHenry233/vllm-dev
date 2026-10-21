@@ -250,6 +250,7 @@ steps:
   - vllm/model_executor/layers/mamba/checkpoint.py
   - tests/models/qwen4_exp/
   commands:
+    - pytest -v -s models/qwen4_exp/test_config.py::test_qsa_compressed_keys_are_not_hisparse_host_sources
     - pytest -v -s models/qwen4_exp/test_hc_ops.py models/qwen4_exp/test_qsa_prepare.py models/qwen4_exp/test_qsa_reference.py
     - pytest -v -s models/qwen4_exp/test_ple.py
   mirror:

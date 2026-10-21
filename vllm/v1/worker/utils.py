@@ -258,6 +258,24 @@ class KVBlockZeroer:
             self.zero_block_ids([0])
 
 
+@dataclass(frozen=True, eq=False)
+class _MambaMetadataReuseKey:
+    spec: MambaSpec
+    builder_cls: type
+    _hash: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_hash", hash((self.spec, self.builder_cls)))
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _MambaMetadataReuseKey):
+            other = (other.spec, other.builder_cls)
+        return (self.spec, self.builder_cls) == other
+
+
 @dataclass(eq=False)
 class AttentionGroup:
     backend: type[AttentionBackend]
@@ -280,6 +298,9 @@ class AttentionGroup:
     metadata_builders: list[AttentionMetadataBuilder] = field(
         default_factory=lambda: []
     )
+    _mamba_metadata_reuse_key: tuple[MambaSpec, _MambaMetadataReuseKey] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def create_metadata_builders(
         self,
@@ -288,6 +309,7 @@ class AttentionGroup:
         kernel_block_size: int | None = None,
         num_metadata_builders: int = 1,
     ):
+        self._mamba_metadata_reuse_key = None
         spec = self.kv_cache_spec
         if kernel_block_size is not None and isinstance(spec, AttentionSpec):
             # A backend in a packed KV cache group may need smaller blocks than

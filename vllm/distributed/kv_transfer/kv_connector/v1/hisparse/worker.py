@@ -28,6 +28,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.layout import HISPARSE_HOT_SUFFIX
 from vllm.v1.hisparse.runtime import (
     HiSparseCacheHandle,
+    HiSparseSlotInvalidator,
     drop_hisparse_host_pool,
     release_pinned_state,
     update_hisparse_residency,
@@ -53,6 +54,16 @@ class _DMADescriptors(NamedTuple):
     src_np: np.ndarray
     dst_np: np.ndarray
     sizes_np: np.ndarray
+
+
+class _DMALayout(NamedTuple):
+    source_indices: np.ndarray
+    source_ptrs: np.ndarray
+    destination_ptrs: np.ndarray
+    block_stride_bytes: np.ndarray
+    row_bytes: np.ndarray
+    source_num_blocks: np.ndarray
+    destination_num_rows: np.ndarray
 
 
 @dataclass
@@ -356,6 +367,7 @@ class HiSparseConnectorWorker:
         self._metrics_event = torch.Event()
         self._metrics_pending = False
         self._init_dma()
+        self._bind_slot_invalidation()
         if self.is_host_writer:
             for layer_index, handle in enumerate(cache_handles):
                 # Draft layers are mirrored once in the next start_step instead.
@@ -389,8 +401,13 @@ class HiSparseConnectorWorker:
             resident_caches.append(cache.view.cache)
         self.host_caches = host_caches
         self.resident_caches = tuple(resident_caches)
+        self._bind_dma_layout()
 
-        for resident_cache, host_cache in zip(resident_caches, host_caches):
+    def _bind_dma_layout(self) -> None:
+        layout = []
+        for handle, resident_cache, host_cache in zip(
+            self.cache_handles, self.resident_caches, self.host_caches, strict=True
+        ):
             row_bytes = resident_cache.shape[-1] * resident_cache.element_size()
             if (
                 resident_cache.ndim != 3
@@ -404,6 +421,34 @@ class HiSparseConnectorWorker:
                 or host_cache.shape[1] * host_cache.element_size() != row_bytes
             ):
                 raise RuntimeError("HiSparse DMA requires contiguous host rows.")
+            layout.append(
+                (
+                    handle.runtime.resident_source_index,
+                    resident_cache.data_ptr(),
+                    host_cache.data_ptr(),
+                    resident_cache.stride(0) * resident_cache.element_size(),
+                    row_bytes,
+                    resident_cache.shape[0],
+                    host_cache.shape[0],
+                )
+            )
+        # These views are owned by this worker until its cache layout is rebound.
+        self._dma_layout = _DMALayout(*np.asarray(layout, dtype=np.int64).T)
+        if getattr(self, "_initialized", False):
+            self._bind_slot_invalidation()
+
+    def _bind_slot_invalidation(self) -> None:
+        # Only the complete target-only layout has a persistent batch plan.
+        leaders = self.leader_runtimes
+        if (
+            self._draft_layers
+            or len(leaders) != len(self.cache_handles)
+            or getattr(self.vllm_config, "speculative_config", None) is not None
+        ):
+            leaders = []
+        self._slot_invalidator = HiSparseSlotInvalidator(
+            self.request_state_indices, leaders
+        )
 
     def start_step(
         self,
@@ -667,46 +712,48 @@ class HiSparseConnectorWorker:
         num_layers = len(layer_indices)
         descriptor_count = len(mirrors) * num_layers
         descriptors = self._acquire_dma_descriptors(descriptor_count)
-        destination_starts = self._row_mirror_destination_starts
+        layout = self._dma_layout
+        single_layer = num_layers == 1
+        layers = layer_indices[0] if single_layer else np.asarray(layer_indices)
+        source_indices = layout.source_indices[layers]
+        source_index_invalid = source_indices >= self._row_mirror_source_starts.shape[1]
+        if not single_layer:
+            source_index_invalid = np.any(source_index_invalid)
+        if source_index_invalid:
+            raise RuntimeError("HiSparse row DMA source index is out of range.")
+        source_rows = self._row_mirror_source_starts[:, source_indices]
+        source_blocks, source_row_offsets = np.divmod(
+            source_rows, self.kernel_block_size
+        )
         row_counts = self._row_mirror_counts
-        for descriptor_offset, layer_index in enumerate(layer_indices):
-            cache = self.cache_handles[layer_index]
-            source_index = cache.runtime.resident_source_index
-            if source_index >= self._row_mirror_source_starts.shape[1]:
-                raise RuntimeError("HiSparse row DMA source index is out of range.")
-            source_rows = self._row_mirror_source_starts[:, source_index]
-            source = self.resident_caches[layer_index]
-            destination = self.host_caches[layer_index]
-            row_bytes = source.shape[-1] * source.element_size()
-            if (
-                source.stride(1) * source.element_size() != row_bytes
-                or destination.shape[1] * destination.element_size() != row_bytes
-            ):
-                raise RuntimeError("HiSparse row DMA requires contiguous rows.")
-            source_blocks, source_row_offsets = np.divmod(
-                source_rows, self.kernel_block_size
-            )
-            source_out_of_range = (
-                np.any(source_blocks < 0)
-                or np.any(source_blocks >= source.shape[0])
-                or np.any(source_row_offsets + row_counts > self.kernel_block_size)
-            )
-            if source_out_of_range:
-                raise RuntimeError("HiSparse row DMA source is out of range.")
-            if np.any(destination_starts < 0) or np.any(
-                destination_starts + row_counts > destination.shape[0]
-            ):
-                raise RuntimeError("HiSparse row DMA index is out of range.")
-            descriptor_slice = slice(descriptor_offset, descriptor_count, num_layers)
-            descriptors.src_np[descriptor_slice] = (
-                source.data_ptr()
-                + source_blocks * source.stride(0) * source.element_size()
-                + source_row_offsets * row_bytes
-            )
-            descriptors.dst_np[descriptor_slice] = (
-                destination.data_ptr() + destination_starts * row_bytes
-            )
-            descriptors.sizes_np[descriptor_slice] = row_counts * row_bytes
+        destination_starts = self._row_mirror_destination_starts
+        if not single_layer:
+            row_counts = row_counts[:, None]
+            destination_starts = destination_starts[:, None]
+        if (
+            np.any(source_blocks < 0)
+            or np.any(source_blocks >= layout.source_num_blocks[layers])
+            or np.any(source_row_offsets + row_counts > self.kernel_block_size)
+        ):
+            raise RuntimeError("HiSparse row DMA source is out of range.")
+        if np.any(destination_starts < 0) or np.any(
+            destination_starts + row_counts > layout.destination_num_rows[layers]
+        ):
+            raise RuntimeError("HiSparse row DMA index is out of range.")
+        row_bytes = layout.row_bytes[layers]
+        # Preserve mirror-major ordering and the selected layers' exact order.
+        shape = (-1,) if single_layer else (-1, num_layers)
+        descriptors.src_np[:descriptor_count].reshape(shape)[:] = (
+            layout.source_ptrs[layers]
+            + source_blocks * layout.block_stride_bytes[layers]
+            + source_row_offsets * row_bytes
+        )
+        descriptors.dst_np[:descriptor_count].reshape(shape)[:] = (
+            layout.destination_ptrs[layers] + destination_starts * row_bytes
+        )
+        descriptors.sizes_np[:descriptor_count].reshape(shape)[:] = (
+            row_counts * row_bytes
+        )
 
         self._submit_dma_descriptors(
             descriptors, descriptor_count, ready_event=ready_event
@@ -897,12 +944,29 @@ class HiSparseConnectorWorker:
                 self._enqueue_row_dma(pending_layers, ready_event=ready_event)
                 self._submitted_mirror_layers.update(pending_layers)
         assert cache.req_id_per_token is not None
-        for _, handle in active:
-            if handle.runtime.is_group_leader:
-                handle.runtime.invalidate_written_slots(
-                    dst_slots[:num_rows],
-                    cache.req_id_per_token[:num_rows],
-                )
+        self._invalidate_written_slots(
+            [handle.runtime for _, handle in active if handle.runtime.is_group_leader],
+            dst_slots[:num_rows],
+            cache.req_id_per_token[:num_rows],
+            allow_batch=cache.decode_batch,
+        )
+
+    def _invalidate_written_slots(
+        self,
+        leaders: Sequence[Any],
+        written_slots: torch.Tensor,
+        req_id_per_token: torch.Tensor,
+        *,
+        allow_batch: bool,
+    ) -> None:
+        invalidator = getattr(self, "_slot_invalidator", None)
+        if invalidator is not None:
+            invalidator(
+                leaders, written_slots, req_id_per_token, allow_batch=allow_batch
+            )
+        else:
+            for leader in leaders:
+                leader.invalidate_written_slots(written_slots, req_id_per_token)
 
     def _finish_mirror_phase(self, ready_event: torch.Event | None = None) -> None:
         state = self._slot_mapping_staging

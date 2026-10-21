@@ -227,6 +227,117 @@ class _FakeEvent:
         pass
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="real CUDA invalidation and DMA"
+)
+@pytest.mark.parametrize("decode_batch", [False, True])
+def test_optional_batch_invalidation_preserves_dma_order_and_leader_fallback(
+    decode_batch,
+):
+    """A real follower layout invalidates each leader after submitting DMA."""
+    from tests.v1.attention.test_sparse_mla_backends import (
+        _bound_hisparse_worker,
+        _hisparse_mirror_metadata,
+    )
+    from vllm.v1.hisparse.runtime import HiSparseRuntime, ResolvedHiSparseConfig
+
+    device = torch.device("cuda")
+    config = ResolvedHiSparseConfig(1, 4, 2)
+    first = HiSparseRuntime(config, 2, 4, torch.float32, device)
+    follower = HiSparseRuntime(
+        config, 2, 4, torch.float32, device, index_group=first.index_group
+    )
+    last = HiSparseRuntime(config, 2, 4, torch.float32, device)
+    mapping = torch.arange(2, dtype=torch.int32, device=device)
+    runtimes = (first, follower, last)
+    for runtime in runtimes:
+        runtime.request_state_indices = mapping
+        runtime.index_group.device_global_indices.fill_(7)
+    slots = torch.tensor(
+        [7] if decode_batch else [6, 7], dtype=torch.int64, device=device
+    )
+    residents = tuple(
+        torch.arange(4 * 4 * 4, dtype=torch.float32, device=device).view(4, 4, 4)
+        + 100 * index
+        for index in range(3)
+    )
+    worker = _bound_hisparse_worker(
+        residents, runtimes=runtimes, source_indices=(0, 0, 1), slot_mapping=slots
+    )
+    log = []
+    try:
+        metadata = _hisparse_mirror_metadata(slots, decode=decode_batch)
+        worker.start_step(
+            HiSparseConnectorMetadata(
+                command=None,
+                host_block_copies=(),
+                source_block_ids=(),
+                row_mirrors={
+                    "request": (
+                        SparseKVRowMirror(
+                            (int(slots[0]), int(slots[0])), 8, slots.numel()
+                        ),
+                    )
+                },
+                all_context_pages_resident=True,
+                residency_updates={},
+            ),
+            mapping.clone(),
+            ["request"],
+            num_tokens=slots.numel(),
+        )
+        # start_step owns the persistent destination; runner inputs are separate.
+        torch.testing.assert_close(
+            worker.request_state_indices,
+            torch.arange(2, dtype=torch.int32, device=device),
+        )
+        worker.prepare_forward({"layer.0": metadata, "layer.2": metadata})
+        original_submit = worker._enqueue_row_dma
+
+        def submit(*args, **kwargs):
+            log.append("DMA")
+            return original_submit(*args, **kwargs)
+
+        with contextlib.ExitStack() as observers:
+            observers.enter_context(
+                patch.object(worker, "_enqueue_row_dma", side_effect=submit)
+            )
+            calls = []
+            for index, runtime in enumerate(runtimes):
+                original = runtime.invalidate_written_slots
+
+                def invalidate(*args, index=index, original=original, **kwargs):
+                    log.append(index)
+                    return original(*args, **kwargs)
+
+                calls.append(
+                    observers.enter_context(
+                        patch.object(
+                            runtime, "invalidate_written_slots", side_effect=invalidate
+                        )
+                    )
+                )
+            worker._enqueue_host_mirror()
+            assert log == ["DMA", 0, 2]
+            calls[1].assert_not_called()
+            for index in (0, 2):
+                got_slots, got_reqs = calls[index].call_args.args
+                torch.testing.assert_close(got_slots, slots)
+                torch.testing.assert_close(got_reqs, metadata.req_id_per_token)
+        torch.accelerator.synchronize()
+        for runtime in (first, last):
+            assert torch.all(runtime.index_group.device_global_indices[0] == -1)
+            assert torch.all(runtime.index_group.device_global_indices[1] == 7)
+        worker.host_write_event.synchronize()
+        for resident, host in zip(residents, worker.host_caches, strict=True):
+            torch.testing.assert_close(
+                host[8 : 8 + slots.numel()], resident.view(-1, 4)[slots.cpu()].cpu()
+            )
+        assert worker._dma_submitted
+    finally:
+        worker.shutdown()
+
+
 @pytest.mark.parametrize("cg_mode", [CUDAGraphMode.FULL, CUDAGraphMode.NONE])
 def test_draft_layer_rows_mirrored_after_drafter(monkeypatch, cg_mode):
     """Draft-layer host rows must hold the drafter's writes before page release.

@@ -16,6 +16,7 @@ from vllm.model_executor.models.config import (
     Qwen4ExpForConditionalGenerationConfig,
 )
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 
 from ...utils import spawn_new_process_for_each_test
@@ -47,6 +48,58 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     }
     values.update(kwargs)
     return Qwen4ExpTextConfig(**values)
+
+
+@pytest.mark.parametrize(
+    "hisparse",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="HiSparse requires NVIDIA CUDA"
+            ),
+        ),
+    ],
+)
+def test_qsa_compressed_keys_are_not_hisparse_host_sources(hisparse: bool) -> None:
+    """Enabling main-KV offload must keep the compressed indexer on device."""
+    from vllm.config import (
+        AttentionConfig,
+        CacheConfig,
+        DeviceConfig,
+        HiSparseConfig,
+        VllmConfig,
+    )
+    from vllm.models.qwen4_exp.common.qsa_cache import QSACompressedKeyCache
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
+
+    config = VllmConfig(
+        device_config=DeviceConfig(device=current_platform.device_type or "cpu"),
+        cache_config=CacheConfig(block_size=64),
+        attention_config=AttentionConfig(
+            hisparse_config=HiSparseConfig() if hisparse else None
+        ),
+    )
+    cache = QSACompressedKeyCache(
+        head_size=128,
+        dtype=torch.bfloat16,
+        cache_config=CacheConfig(block_size=64),
+        prefix="qsa.indexer.compressed",
+        vllm_config=config,
+        compress_ratio=4,
+    )
+
+    spec = cache.get_kv_cache_spec(config)
+
+    assert spec == MLAAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+        cache_role=SparseCacheRole.INDEXER if hisparse else SparseCacheRole.SPARSE,
+    )
 
 
 def test_moe_sp_rejects_pipeline_parallel() -> None:

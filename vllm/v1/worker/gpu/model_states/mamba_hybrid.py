@@ -91,9 +91,19 @@ class MambaHybridModelState(DefaultModelState):
         # kernel reusing the postprocess copy machinery, so the per-step src
         # columns and the running state_idx are kept GPU-resident.
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
+        self._block_tables: BlockTables | None = None
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
+        self._aligned_index_views: (
+            tuple[
+                MambaSpecDecodeGPUContext,
+                torch.Tensor,
+                int,
+                tuple[torch.Tensor, ...],
+            ]
+            | None
+        ) = None
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -143,6 +153,8 @@ class MambaHybridModelState(DefaultModelState):
     def initialize_kv_cache(
         self, kv_cache_config: KVCacheConfig, block_tables: BlockTables
     ) -> None:
+        self._block_tables = block_tables
+        self._aligned_index_views = None
         if not self._align_mode:
             return
         mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
@@ -314,13 +326,35 @@ class MambaHybridModelState(DefaultModelState):
                 all_group_indices = self._mamba_ctx.compute_aligned_state_indices(
                     input_batch.seq_lens, num_reqs
                 )
+                cached = getattr(self, "_aligned_index_views", None)
+                backing = self._mamba_ctx.aligned_state_indices
+                if (
+                    cached is None
+                    or cached[0] is not self._mamba_ctx
+                    or cached[1] is not backing
+                    or cached[2] != num_reqs
+                ):
+                    assert backing is not None
+                    cached = (
+                        self._mamba_ctx,
+                        backing,
+                        num_reqs,
+                        all_group_indices.unbind(0),
+                    )
+                    self._aligned_index_views = cached
                 for group_idx, builder in aligned_index_builders:
-                    builder.mamba_aligned_state_indices = all_group_indices[group_idx]
+                    builder.mamba_aligned_state_indices = cached[3][group_idx]
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        )
+        block_table_provider = getattr(self, "_block_tables", None)
+        slot_mapping_rows = (
+            block_table_provider.get_slot_mapping_rows(slot_mappings)
+            if block_table_provider is not None
+            else slot_mappings
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -332,7 +366,7 @@ class MambaHybridModelState(DefaultModelState):
             seq_lens=input_batch.seq_lens,
             max_seq_len=max_seq_len,
             block_tables=block_tables,
-            slot_mappings=slot_mappings,
+            slot_mappings=slot_mapping_rows,
             kv_cache_config=kv_cache_config,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,

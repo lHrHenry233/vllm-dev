@@ -103,6 +103,18 @@ class BlockTables:
         )
 
     def init_block_table_layout_tensors(self) -> None:
+        self._input_block_table_view_rows = -1
+        self._input_block_table_views: tuple[torch.Tensor, ...] = ()
+        self._slot_mapping_views: (
+            tuple[
+                torch.Tensor,
+                torch.Size,
+                int,
+                torch.Tensor,
+                tuple[torch.Tensor, ...],
+            ]
+            | None
+        ) = None
         self.block_table_ptrs = self._make_ptr_tensor(
             [b.gpu for b in self.block_tables]
         )
@@ -185,6 +197,7 @@ class BlockTables:
             num_computed_tokens = self.sliding_window_reach
         num_reqs = idx_mapping.shape[0]
         num_rows = num_reqs_padded
+        use_input_tables = out is None
         if out is None:
             out = tuple(self.input_block_tables)
             out_ptrs = self.input_block_table_ptrs
@@ -208,7 +221,17 @@ class BlockTables:
             MASK_SLIDING_WINDOW=mask_sliding_window,
             BLOCK_SIZE=1024,  # type: ignore
         )
+        if use_input_tables:
+            return self._get_input_block_table_views(num_reqs_padded)
         return tuple(bt[:num_reqs_padded] for bt in out)
+
+    def _get_input_block_table_views(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
+        if num_reqs != self._input_block_table_view_rows:
+            self._input_block_table_views = tuple(
+                bt[:num_reqs] for bt in self.input_block_tables
+            )
+            self._input_block_table_view_rows = num_reqs
+        return self._input_block_table_views
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         # NOTE(woosuk): The output may be used for CUDA graph capture.
@@ -224,7 +247,7 @@ class BlockTables:
             block_table[:num_rows].zero_()
         # Profiling may populate the returned rows with valid block IDs.
         self._num_dirty_rows = num_reqs
-        return tuple(block_table[:num_reqs] for block_table in self.input_block_tables)
+        return self._get_input_block_table_views(num_reqs)
 
     def compute_slot_mappings(
         self,
@@ -235,7 +258,11 @@ class BlockTables:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.num_kv_cache_groups == 0:
-            return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
+            return (
+                self._get_slot_mapping_view(num_tokens_padded)
+                if out is None
+                else out[:, :num_tokens_padded]
+            )
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
@@ -257,7 +284,37 @@ class BlockTables:
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
+        if out is None:
+            return self._get_slot_mapping_view(num_tokens_padded)
         return slot_mappings[:, :num_tokens_padded]
+
+    def _get_slot_mapping_view(self, num_tokens: int) -> torch.Tensor:
+        cached = self._slot_mapping_views
+        owner = self.slot_mappings
+        if (
+            cached is None
+            or cached[0] is not owner
+            or cached[1] != owner.shape
+            or cached[2] != num_tokens
+        ):
+            view = owner[:, :num_tokens]
+            cached = (owner, owner.shape, num_tokens, view, view.unbind(0))
+            self._slot_mapping_views = cached
+        return cached[3]
+
+    def get_slot_mapping_rows(
+        self, slot_mappings: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """Reuse rows only for the current owned view; keep custom outputs intact."""
+        cached = self._slot_mapping_views
+        if (
+            cached is not None
+            and cached[0] is self.slot_mappings
+            and cached[1] == self.slot_mappings.shape
+            and cached[3] is slot_mappings
+        ):
+            return cached[4]
+        return slot_mappings
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
         # Fill the entire slot_mappings tensor, not just the first `num_tokens` entries.
@@ -268,7 +325,7 @@ class BlockTables:
         # Therefore, this method must return the persistent tensor
         # with the same memory address as that used during the model's forward pass,
         # rather than allocating a new tensor.
-        return self.slot_mappings[:, :num_tokens]
+        return self._get_slot_mapping_view(num_tokens)
 
 
 @triton.jit(do_not_specialize=["num_reqs"])

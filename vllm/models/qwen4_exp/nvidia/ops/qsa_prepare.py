@@ -107,6 +107,8 @@ def _store_rotated(dst, y, o1, o2, scale):
         "num_state_blocks",
         "num_compressed_blocks",
         "num_k_work",
+        "num_main_slots",
+        "num_main_mirror_slots",
     ]
 )
 def _qsa_prepare_kernel(
@@ -165,12 +167,25 @@ def _qsa_prepare_kernel(
     main_cache_stride_token,
     main_cache_stride_head,
     main_slots_ptr,
+    num_main_slots,
     main_k_scale,
     main_v_scale,
+    main_k_out_ptr,
+    main_v_out_ptr,
+    main_mirror_cache_ptr,
+    main_mirror_stride_block,
+    main_mirror_stride_token,
+    main_mirror_stride_head,
+    main_mirror_slots_ptr,
+    num_main_mirror_slots,
     MAIN_HQ: tl.constexpr,
     MAIN_HK: tl.constexpr,
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
+    MAIN_MIRROR_PAGE_SIZE: tl.constexpr,
+    WRITE_MAIN_CACHE: tl.constexpr,
+    RETURN_MAIN_KV: tl.constexpr,
+    HAS_MAIN_MIRROR: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
@@ -217,17 +232,41 @@ def _qsa_prepare_kernel(
         o1 = x1 * cos - x2 * sin
         o2 = x2 * cos + x1 * sin
         if is_k:
-            slot = tl.load(main_slots_ptr + token).to(tl.int64)
-            if slot >= 0:
-                dst = (
-                    main_cache_ptr
-                    + (slot // MAIN_PAGE_SIZE) * main_cache_stride_block
-                    + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
-                    + kv_head * main_cache_stride_head
-                )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
-                v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+            v = tl.load(src + MAIN_HK * MAIN_D + dims)
+            if RETURN_MAIN_KV:
+                out = (token * MAIN_HK + kv_head) * MAIN_D
+                _store_rotated(main_k_out_ptr + out, y, o1, o2, None)
+                tl.store(main_v_out_ptr + out + dims, v)
+            if WRITE_MAIN_CACHE:
+                slot = tl.load(
+                    main_slots_ptr + token, mask=token < num_main_slots, other=-1
+                ).to(tl.int64)
+                if slot >= 0:
+                    dst = (
+                        main_cache_ptr
+                        + (slot // MAIN_PAGE_SIZE) * main_cache_stride_block
+                        + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
+                        + kv_head * main_cache_stride_head
+                    )
+                    _store_rotated(dst, y, o1, o2, main_k_scale)
+                    tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+            if HAS_MAIN_MIRROR:
+                mirror_slot = tl.load(
+                    main_mirror_slots_ptr + token,
+                    mask=token < num_main_mirror_slots,
+                    other=-1,
+                ).to(tl.int64)
+                if mirror_slot >= 0:
+                    dst = (
+                        main_mirror_cache_ptr
+                        + (mirror_slot // MAIN_MIRROR_PAGE_SIZE)
+                        * main_mirror_stride_block
+                        + (mirror_slot % MAIN_MIRROR_PAGE_SIZE)
+                        * main_mirror_stride_token
+                        + kv_head * main_mirror_stride_head
+                    )
+                    _store_rotated(dst, y, o1, o2, main_k_scale)
+                    tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
             _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
@@ -530,11 +569,19 @@ def qsa_prepare(
     main_slot_mapping: torch.Tensor,
     main_k_scale: float,
     main_v_scale: float,
+    main_k_out: torch.Tensor | None = None,
+    main_v_out: torch.Tensor | None = None,
+    write_main_cache: bool = True,
+    main_mirror_cache: torch.Tensor | None = None,
+    main_mirror_slots: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize Q, compress K, then update the circular raw state.
 
     Also prepares the main attention (QK-norm/RoPE, gate copy, K/V cache write)
-    and returns its Q and gate.
+    and returns its Q and gate. Optional K/V outputs remain unquantized.
+    Cache targets use [block, token, head, 2 * head_dim] with arbitrary outer
+    strides; slots may omit padded rows. Disabling the main cache write also
+    requires omitting the mirror target.
     """
     num_tokens = q.shape[0]
     main_head_dim = main_kv_cache.shape[-1] // 2
@@ -571,7 +618,25 @@ def qsa_prepare(
     qkv_width = 2 * (num_main_q_heads + num_main_kv_heads) * main_head_dim
     assert main_qkv.shape == (num_tokens, qkv_width)
     assert main_qkv.stride(-1) == 1
-    assert main_slot_mapping.shape == (num_tokens,)
+    assert main_kv_cache.ndim == 4 and main_kv_cache.stride(-1) == 1
+    assert main_slot_mapping.ndim == 1 and main_slot_mapping.numel() <= num_tokens
+    assert main_slot_mapping.stride(0) == 1
+    assert (main_k_out is None) == (main_v_out is None)
+    if main_k_out is not None:
+        assert main_v_out is not None
+        for tensor in (main_k_out, main_v_out):
+            assert tensor.shape == (num_tokens, num_main_kv_heads, main_head_dim)
+            assert tensor.is_contiguous() and tensor.dtype == main_qkv.dtype
+            assert tensor.device == main_qkv.device
+    assert (main_mirror_cache is None) == (main_mirror_slots is None)
+    if main_mirror_cache is not None:
+        assert write_main_cache and main_mirror_slots is not None
+        assert main_mirror_cache.ndim == 4 and main_mirror_cache.stride(-1) == 1
+        assert main_mirror_cache.shape[2:] == main_kv_cache.shape[2:]
+        assert main_mirror_cache.dtype == main_kv_cache.dtype
+        assert main_mirror_slots.ndim == 1
+        assert main_mirror_slots.numel() <= num_tokens
+        assert main_mirror_slots.stride(0) == 1
 
     if num_tokens <= 4096:
         TILE_T_Q, TILE_H_Q = 2, 2
@@ -636,12 +701,35 @@ def qsa_prepare(
         main_cache_stride_token=main_kv_cache.stride(1),
         main_cache_stride_head=main_kv_cache.stride(2),
         main_slots_ptr=main_slot_mapping,
+        num_main_slots=main_slot_mapping.numel(),
         main_k_scale=main_k_scale,
         main_v_scale=main_v_scale,
+        main_k_out_ptr=main_k_out,
+        main_v_out_ptr=main_v_out,
+        main_mirror_cache_ptr=main_mirror_cache,
+        main_mirror_stride_block=(
+            main_mirror_cache.stride(0) if main_mirror_cache is not None else 0
+        ),
+        main_mirror_stride_token=(
+            main_mirror_cache.stride(1) if main_mirror_cache is not None else 0
+        ),
+        main_mirror_stride_head=(
+            main_mirror_cache.stride(2) if main_mirror_cache is not None else 0
+        ),
+        main_mirror_slots_ptr=main_mirror_slots,
+        num_main_mirror_slots=(
+            main_mirror_slots.numel() if main_mirror_slots is not None else 0
+        ),
         MAIN_HQ=num_main_q_heads,
         MAIN_HK=num_main_kv_heads,
         MAIN_D=main_head_dim,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
+        MAIN_MIRROR_PAGE_SIZE=(
+            main_mirror_cache.shape[1] if main_mirror_cache is not None else 1
+        ),
+        WRITE_MAIN_CACHE=write_main_cache,
+        RETURN_MAIN_KV=main_k_out is not None,
+        HAS_MAIN_MIRROR=main_mirror_cache is not None,
         num_warps=1,
     )
     return main_q_out, main_gate_out

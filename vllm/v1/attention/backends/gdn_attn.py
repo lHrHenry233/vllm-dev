@@ -3,7 +3,8 @@
 """Backend for GatedDeltaNet attention."""
 
 import math
-from dataclasses import dataclass, replace
+from copy import copy
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
@@ -655,13 +656,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
 
         if self._stage_decode(num_prefills, num_decodes, num_spec_decodes):
-            self.non_spec_state_indices_tensor[:num_decodes].copy_(
-                non_spec_state_indices_tensor, non_blocking=True
+            non_spec_state_indices_tensor = self._stage_decode_state_indices(
+                non_spec_state_indices_tensor, num_decodes, batch_size
             )
-            non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
-                :batch_size
-            ]
-            non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 non_spec_query_start_loc, non_blocking=True
@@ -730,6 +727,26 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_decodes <= self.decode_cudagraph_max_bs
         )
 
+    def _stage_decode_state_indices(
+        self, indices: torch.Tensor, num_decodes: int, batch_size: int
+    ) -> torch.Tensor:
+        if (
+            self.supports_update_block_table
+            and not self.use_spec_decode
+            and self.mamba_aligned_state_indices is not None
+            and indices.stride(0) == 1
+        ):
+            # MRV2 updates this persistent, per-group buffer before graph replay.
+            staged = indices if indices.shape[0] == batch_size else indices[:batch_size]
+        else:
+            self.non_spec_state_indices_tensor[:num_decodes].copy_(
+                indices, non_blocking=True
+            )
+            staged = self.non_spec_state_indices_tensor[:batch_size]
+        if num_decodes < batch_size:
+            staged[num_decodes:].fill_(NULL_BLOCK_ID)
+        return staged
+
     def update_block_table(
         self,
         metadata: GDNAttentionMetadata,
@@ -750,7 +767,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         masks = m.spec_sequence_masks_cpu
         spec_indices = non_spec_indices = prefill_indices = None
         if masks is None:
-            non_spec_indices = blk_table[:, 0]
+            if self.vllm_config.cache_config.mamba_cache_mode == "align":
+                cached = getattr(self, "_aligned_non_spec_view", None)
+                if cached is None or cached[0] is not blk_table:
+                    cached = (blk_table, blk_table.select(1, 0))
+                    self._aligned_non_spec_view = cached
+                non_spec_indices = cached[1]
+            else:
+                non_spec_indices = blk_table.select(1, 0)
             if m.num_prefills > 0:
                 prefill_indices = non_spec_indices[m.num_decodes :]
         elif m.num_prefills == 0:
@@ -774,19 +798,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if self._stage_decode(m.num_prefills, m.num_decodes, m.num_spec_decodes):
             assert m.non_spec_state_indices_tensor is not None
             batch_size = m.non_spec_state_indices_tensor.shape[0]
-            self.non_spec_state_indices_tensor[: m.num_decodes].copy_(
-                non_spec_indices, non_blocking=True
+            non_spec_indices = self._stage_decode_state_indices(
+                non_spec_indices, m.num_decodes, batch_size
             )
-            non_spec_indices = self.non_spec_state_indices_tensor[:batch_size]
-            non_spec_indices[m.num_decodes :].fill_(NULL_BLOCK_ID)
 
-        return replace(
-            m,
-            spec_state_indices_tensor=spec_indices,
-            non_spec_state_indices_tensor=non_spec_indices,
-            prefill_state_indices=prefill_indices,
-            checkpoint=checkpoint,
-        )
+        # Batch fields are shared; only these group-local fields change.
+        result = copy(m)
+        result.spec_state_indices_tensor = spec_indices
+        result.non_spec_state_indices_tensor = non_spec_indices
+        result.prefill_state_indices = prefill_indices
+        result.checkpoint = checkpoint
+        return result
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

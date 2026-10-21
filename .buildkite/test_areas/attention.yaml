@@ -12,6 +12,10 @@ steps:
     - vllm/model_executor/layers/attention
     - vllm/v1/attention
     - tests/v1/attention
+    - vllm/v1/hisparse
+    - csrc/hisparse_kernels.cu
+    - csrc/ops.h
+    - csrc/torch_bindings.cpp
   commands:
     - pytest -v -s v1/attention
   mirror:
@@ -50,6 +54,10 @@ steps:
     - vllm/model_executor/layers/attention
     - vllm/v1/attention
     - tests/v1/attention
+    - vllm/v1/hisparse
+    - csrc/hisparse_kernels.cu
+    - csrc/ops.h
+    - csrc/torch_bindings.cpp
   commands:
     - pytest -v -s v1/attention
   mirror:

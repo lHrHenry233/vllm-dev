@@ -897,9 +897,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
 
-        # Disable any use of KVConnector for dummy runs.
-        self.kv_connector.set_disabled(True)
-
         # Get the intermediate tensors for the dummy run.
         intermediate_tensors = None
         if not self.is_first_pp_rank:
@@ -907,12 +904,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors = self.intermediate_tensors[:num_tokens]
 
         max_loras = self.lora_config.max_loras if self.lora_config is not None else 0
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config,
-            num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
-            num_sampled_tokens=None,
-            remove_lora=True,
-            num_active_loras=max_loras,
+        with (
+            self.kv_connector.disabled(),
+            self.maybe_dummy_run_with_lora(
+                self.lora_config,
+                num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
+                num_sampled_tokens=None,
+                remove_lora=True,
+                num_active_loras=max_loras,
+            ),
         ):
             # Execute the model.
             self.execute_model(
@@ -925,8 +925,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
             )
-        self.kv_connector.set_disabled(False)
-
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
             return None, None
@@ -1089,7 +1087,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         compilation_counter.num_gpu_runner_capture_triggers += 1
 
         start_time = time.perf_counter()
-        with freeze_gc_for_cudagraph_capture():
+        with freeze_gc_for_cudagraph_capture(), self.kv_connector.disabled():
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
@@ -1924,7 +1922,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         elif not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
             slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_mappings, self.kv_cache_config
+                self.block_tables.get_slot_mapping_rows(slot_mappings),
+                self.kv_cache_config,
             )
             assert block_tables is not None
             attn_groups = self.attn_groups

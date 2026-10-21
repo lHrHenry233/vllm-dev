@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.models.qwen4_exp.common.ops.ple import prepare_ple_inputs
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -103,12 +105,29 @@ class Qwen4ExpModelState(MambaHybridModelState):
 
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc
-        query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
-        # Represent unused capacity as trailing zero-length requests.
-        query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        if current_platform.is_cuda() and self.ngram_context.is_cuda:
+            prepare_ple_inputs(
+                input_batch.idx_mapping,
+                req_states.num_computed_tokens.gpu,
+                req_states.all_token_ids.gpu,
+                input_batch.query_start_loc,
+                self.ngram_context,
+                query_start_loc,
+                input_batch.num_reqs,
+                num_reqs_padded,
+                self.ngram_eos_token_id,
+            )
+            ngram_context = self.ngram_context
+        else:
+            query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
+            # Represent unused capacity as trailing zero-length requests.
+            query_start_loc[num_reqs_padded + 1 :].copy_(
+                input_batch.query_start_loc[-1]
+            )
+            ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
         return model_inputs
 

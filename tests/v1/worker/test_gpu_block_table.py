@@ -14,6 +14,125 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_reused_block_table_views_follow_writes_and_batch_shapes():
+    """A repeated batch reuses wrappers while reading the newly gathered rows."""
+    device = torch.device("cuda")
+    tables = BlockTables([16, 32], 4, 64, [8, 8], device)
+    tables.append_block_ids(0, ([1, 2], [10, 11]), overwrite=True)
+    tables.append_block_ids(1, ([3], [12]), overwrite=True)
+    tables.apply_staged_writes()
+    idx = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    first = tables.gather_block_tables(idx, 4)
+    repeated = tables.gather_block_tables(idx, 4)
+    assert all(a is b for a, b in zip(first, repeated))
+
+    tables.append_block_ids(0, ([7], [13]), overwrite=True)
+    tables.apply_staged_writes()
+    smaller = tables.gather_block_tables(idx[:1], 1)
+    assert all(t.shape[0] == 1 for t in smaller)
+    assert [t[0, 0].item() for t in smaller] == [7, 13]
+    # The earlier wrappers remain views of the same persistent storage.
+    assert [t[0, 0].item() for t in first] == [7, 13]
+    assert all(torch.count_nonzero(t[1:]).item() == 0 for t in first)
+
+    restored = tables.gather_block_tables(idx, 4)
+    assert [t[1, 0].item() for t in restored] == [3, 12]
+    # Callers supplying their own output buffers must retain that ownership.
+    other = tuple(torch.empty_like(t) for t in tables.input_block_tables)
+    other_ptrs = tables._make_ptr_tensor(other)
+    separate = tables.gather_block_tables(idx, 4, other, other_ptrs)
+    assert all(t.data_ptr() == dst.data_ptr() for t, dst in zip(separate, other))
+    tables.append_block_ids(0, ([8], [14]), overwrite=True)
+    tables.apply_staged_writes()
+    tables.gather_block_tables(idx, 4)
+    assert [t[0, 0].item() for t in first] == [8, 14]
+    assert [t[0, 0].item() for t in separate] == [7, 13]
+
+
+@pytest.mark.parametrize("num_groups", [0, 2])
+def test_reused_slot_mapping_views_follow_shape_and_owner_changes(num_groups):
+    """Owned rows stay live; evicted and replaced wrappers keep their own storage."""
+    tables = BlockTables(
+        [16] * num_groups, 2, 8, [2] * num_groups, torch.device("cuda")
+    )
+    first = tables.get_dummy_slot_mappings(4)
+    repeated = tables.get_dummy_slot_mappings(4)
+    torch.testing.assert_close(first, repeated)
+    assert first is repeated
+    rows = tables.get_slot_mapping_rows(first)
+    assert isinstance(rows, tuple) and len(rows) == num_groups
+    assert tables.get_slot_mapping_rows(repeated) is rows
+    tables.slot_mappings.fill_(17)
+    assert all(torch.all(row == 17) for row in rows)
+    for size in (0, 1, 4):
+        changed = tables.get_dummy_slot_mappings(size)
+        assert changed.shape == (num_groups, size)
+        assert torch.all(first == PAD_SLOT_ID)
+        if size != 4:
+            assert tables.get_slot_mapping_rows(first) is first
+    assert changed is not first
+    assert tables.get_slot_mapping_rows(first) is first
+    alias = changed.view_as(changed)
+    assert tables.get_slot_mapping_rows(alias) is alias
+    custom = torch.full_like(first, 31)
+    assert tables.get_slot_mapping_rows(custom) is custom
+    old_owner = tables.slot_mappings
+    old_owner.fill_(41)
+    tables.slot_mappings = torch.zeros_like(old_owner)
+    assert tables.get_slot_mapping_rows(changed) is changed
+    replacement = tables.get_dummy_slot_mappings(4)
+    tables.slot_mappings.fill_(53)
+    assert replacement is not first
+    assert all(torch.all(row == 41) for row in rows)
+    assert torch.all(replacement == 53)
+    tables.init_block_table_layout_tensors()
+    assert tables.get_slot_mapping_rows(replacement) is replacement
+    initialized = tables.get_dummy_slot_mappings(4)
+    assert initialized is not replacement
+    assert torch.all(replacement == PAD_SLOT_ID)
+    tables.slot_mappings = torch.zeros(
+        (num_groups, 10), dtype=torch.int64, device="cuda"
+    )
+    assert tables.get_slot_mapping_rows(initialized) is initialized
+    resized = tables.get_dummy_slot_mappings(4)
+    assert isinstance(resized, torch.Tensor) and isinstance(first, torch.Tensor)
+    assert resized.shape == first.shape and resized.stride(0) == 10
+
+
+def test_reused_slot_mapping_rows_follow_compute_and_graph_replay():
+    """Cached rows read GPU writes; same-shaped custom outputs stay separate."""
+    device = torch.device("cuda")
+    tables = BlockTables([16, 32], 2, 8, [2, 2], device)
+    tables.append_block_ids(0, ([1], [10]), overwrite=True)
+    tables.apply_staged_writes()
+    idx = torch.tensor([0], dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    positions = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    first = tables.compute_slot_mappings(idx, starts, positions, 4)
+    rows = tables.get_slot_mapping_rows(first)
+    repeated = tables.compute_slot_mappings(idx, starts, positions, 4)
+    assert first is repeated and tables.get_slot_mapping_rows(repeated) is rows
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        tables.compute_slot_mappings(idx, starts, positions, 4)
+    positions.add_(2)
+    graph.replay()
+    expected = torch.tensor([[18, 19, -1, -1], [322, 323, -1, -1]], device=device)
+    torch.testing.assert_close(first, expected)
+    assert all(torch.equal(row, expected[i]) for i, row in enumerate(rows))
+    custom = torch.empty_like(tables.slot_mappings)
+    positions.add_(2)
+    separate = tables.compute_slot_mappings(idx, starts, positions, 4, out=custom)
+    assert separate.shape == first.shape
+    assert tables.get_slot_mapping_rows(separate) is separate
+    assert isinstance(separate, torch.Tensor)
+    torch.testing.assert_close(first, expected)
+    torch.testing.assert_close(separate[:, :2], expected[:, :2] + 2)
+    tables.compute_slot_mappings(idx[:0], starts[:1], positions[:0], 0)
+    assert torch.all(first == PAD_SLOT_ID)
+
+
 def test_block_tables_apply_staged_writes_fuses_kv_groups(monkeypatch):
     device = torch.device("cuda")
     block_tables = BlockTables(
