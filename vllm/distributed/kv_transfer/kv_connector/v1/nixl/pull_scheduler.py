@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -30,6 +31,13 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         kv_cache_config: "KVCacheConfig",
     ):
         super().__init__(vllm_config, engine_id, kv_cache_config)
+        # Actual reads outlive client cancellation and keep the producer lease.
+        self._reqs_recving: set[str] = set()
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        for req_id in connector_output.finished_recving or ():
+            self._reqs_recving.discard(req_id)
+        super().update_connector_output(connector_output)
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -175,6 +183,8 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
                         # something to pull; a full local hit stays RUNNING.
                         num_external_tokens > 0,
                     )
+                    if num_external_tokens > 0:
+                        self._reqs_recving.add(request.request_id)
 
                 else:
                     logger.warning(
@@ -212,9 +222,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
         is_p_node = bool(params.get("do_remote_decode"))
         is_d_node = not is_p_node
 
-        # Stop heartbeating for aborted requests that never reached finished_recving:
-        # normal path cleans up in update_connector_output.
-        self._stop_heartbeat(request.request_id)
+        # An aborted owner still pins a live read (possibly used by followers).
+        # Its producer lease must survive until worker completion.
+        if request.request_id not in self._reqs_recving:
+            self._stop_heartbeat(request.request_id)
 
         if params.get("do_remote_prefill"):
             # If do_remote_prefill is still True when the request is finished,
