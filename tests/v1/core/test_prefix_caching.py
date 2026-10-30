@@ -31,6 +31,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.mamba.checkpoint import (
+    compute_mamba_prefill_checkpoints,
+)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -92,7 +95,9 @@ def make_request(
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     lora_request: LoRARequest | None = None,
+    num_hash_lookahead_tokens: int = 0,
     session_id: str | None = None,
+    sampling_params: SamplingParams | None = None,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -106,7 +111,8 @@ def make_request(
             )
             mm_features.append(mm_feature)
 
-    sampling_params = SamplingParams(max_tokens=17, prompt_logprobs=prompt_logprobs)
+    if sampling_params is None:
+        sampling_params = SamplingParams(max_tokens=17, prompt_logprobs=prompt_logprobs)
     sampling_params.update_from_generation_config({}, eos_token_id=100)
 
     return Request(
@@ -117,7 +123,9 @@ def make_request(
         pooling_params=None,
         lora_request=lora_request,
         cache_salt=cache_salt,
-        block_hasher=get_request_block_hasher(block_size, hash_fn),
+        block_hasher=get_request_block_hasher(
+            block_size, hash_fn, num_hash_lookahead_tokens
+        ),
         session_id=session_id,
     )
 
@@ -2632,6 +2640,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         max_num_scheduled_tokens=3 * block_size,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         use_eagle_block_drop=False,
+        num_hash_lookahead_tokens=0,
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
         mamba_shared_prefix_checkpoint=False,
@@ -3036,6 +3045,73 @@ def test_computed_blocks_not_evicted():
     )
     assert blocks is not None and len(blocks.blocks[0]) == 1
     assert blocks.blocks[0][0].block_id == 2
+
+
+@pytest.mark.parametrize(
+    "start,prompt_logprobs,for_connector,expected_hit",
+    [(0, None, False, 0), (5, None, False, 4), (5, 0, False, 4), (5, None, True, 4)],
+)
+def test_fixed_token_scores_reuse_only_unscored_prefix(
+    start, prompt_logprobs, for_connector, expected_hit
+):
+    block_size = 4
+    manager = make_kv_cache_manager(
+        make_kv_cache_config(block_size, 8),
+        max_model_len=32,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    tokens = list(range(16))
+    warm = make_request("warm", tokens, block_size, sha256)
+    assert manager.allocate_slots(warm, len(tokens)) is not None
+    manager.free(warm)
+    scoring = make_request(
+        "scoring",
+        tokens,
+        block_size,
+        sha256,
+        sampling_params=SamplingParams(
+            prompt_logprob_token_ids=[[1]] * (len(tokens) - 1 - start),
+            prompt_logprob_start=start,
+            prompt_logprobs=prompt_logprobs,
+            skip_reading_prefix_cache=False,
+        ),
+    )
+    lookup = (
+        manager.get_computed_blocks_for_connector
+        if for_connector
+        else manager.get_computed_blocks
+    )
+    assert lookup(scoring)[1] == expected_hit
+    if expected_hit:
+        assert lookup(scoring, max_cache_hit_length=len(tokens))[1] == expected_hit
+        assert lookup(scoring, max_cache_hit_length=block_size - 1)[1] == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected_limit",
+    [
+        ({}, None),
+        ({"skip_reading_prefix_cache": True}, 0),
+        # Prompt scoring skips cache reads by default.
+        ({"prompt_logprobs": 1, "prompt_logprob_start": 5}, 0),
+        ({"prompt_logprobs": 1, "skip_reading_prefix_cache": False}, 0),
+        (
+            {
+                "prompt_logprobs": 1,
+                "prompt_logprob_start": 5,
+                "skip_reading_prefix_cache": False,
+            },
+            5,
+        ),
+    ],
+)
+def test_prefix_cache_hit_limit(kwargs, expected_limit):
+    request = make_request(
+        "req", list(range(16)), 4, sha256, sampling_params=SamplingParams(**kwargs)
+    )
+    assert request.prefix_cache_hit_limit == expected_limit
+    assert request.skip_reading_external_kv == (expected_limit is not None)
 
 
 def test_basic_prefix_caching_disabled():
@@ -4194,67 +4270,275 @@ def test_emit_cached_block_events_zero_cached():
     assert pool.take_events() == []
 
 
-def test_eagle_enabled_removes_last_block():
-    """Verify Eagle does NOT remove blocks when request
-    length is divisible by block size."""
+@pytest.mark.parametrize(
+    ("lookahead", "num_prompt_tokens", "expected_blocks"),
+    [
+        # Legacy drop: pop the logits block, then drop one more.
+        (False, 48, 1),
+        (False, 37, 1),
+        # Lookahead hashes prove the boundary, so no extra block is dropped.
+        (True, 48, 2),
+        (True, 37, 2),
+    ],
+)
+def test_eagle_identical_prompt_hit(
+    lookahead: bool, num_prompt_tokens: int, expected_blocks: int
+):
     block_size = 16
     manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, num_blocks=10),
         max_model_len=8192,
         enable_caching=True,
-        use_eagle=True,
+        use_eagle=not lookahead,
+        num_hash_lookahead_tokens=lookahead,
         hash_block_size=block_size,
     )
+    token_ids = [0] * num_prompt_tokens
 
-    # Request with 3 full blocks (48 tokens)
-    token_ids = [0] * (3 * block_size)
-    req = make_request("divisible_request", token_ids, block_size, sha256)
-
-    # Prime the cache
-    computed_blocks, _, _ = manager.get_computed_blocks(req)
-    manager.allocate_slots(
-        req, len(token_ids), len(computed_blocks.blocks[0]) * 16, computed_blocks
+    req = make_request(
+        "prime", token_ids, block_size, sha256, num_hash_lookahead_tokens=lookahead
     )
+    assert manager.allocate_slots(req, len(token_ids)) is not None
     manager.free(req)
 
-    # New request with same tokens + Eagle enabled
-    req_eagle = make_request("eagle_divisible", token_ids, block_size, sha256)
+    req_eagle = make_request(
+        "eagle", token_ids, block_size, sha256, num_hash_lookahead_tokens=lookahead
+    )
     computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
-
-    # Should retain 1 block:
-    # 1. Original 3 blocks → pop last hash → 2 matched blocks
-    # 2. drop last matched block → 1 remaining block
-    assert len(computed_blocks.blocks[0]) == 1
-    assert num_tokens == 1 * block_size  # 16 tokens
+    assert len(computed_blocks.blocks[0]) == expected_blocks
+    assert num_tokens == expected_blocks * block_size
 
 
-def test_eagle_with_partial_blocks():
-    """Test Eagle behavior with requests containing partial blocks."""
-    block_size = 16
+@pytest.mark.parametrize("lookahead", [1, 2])
+def test_kv_events_reconstruct_lookahead_block_hashes(lookahead: int):
+    block_size = 2
     manager = make_kv_cache_manager(
-        make_kv_cache_config(block_size, num_blocks=10),
+        make_kv_cache_config(block_size, num_blocks=20),
         max_model_len=8192,
         enable_caching=True,
-        use_eagle=True,
+        use_eagle=False,
+        num_hash_lookahead_tokens=lookahead,
         hash_block_size=block_size,
+        enable_kv_cache_events=True,
     )
-    # 2 full blocks + 5 tokens (non-divisible length)
-    token_ids = [0] * (2 * block_size + 5)
-    req = make_request("partial_block_test", token_ids, block_size, sha256)
-
-    # Prime the cache
-    computed_blocks, _, _ = manager.get_computed_blocks(req)
-    manager.allocate_slots(
-        req, len(token_ids), len(computed_blocks.blocks[0]) * 16, computed_blocks
+    token_ids = list(range(2 * block_size + lookahead))
+    request = make_request(
+        "request",
+        token_ids,
+        block_size,
+        sha256,
+        num_hash_lookahead_tokens=lookahead,
     )
-    manager.free(req)
+    assert manager.allocate_slots(request, request.num_tokens) is not None
 
-    # New request with Eagle enabled
-    req_eagle = make_request("partial_eagle", token_ids, block_size, sha256)
-    computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
-    # Original match: 2 full blocks → Eagle removes 1 → 1 remaining
-    assert len(computed_blocks.blocks[0]) == 1
-    assert num_tokens == 1 * block_size
+    (event,) = manager.take_events()
+    assert isinstance(event, BlockStored)
+    assert event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(block_hash)
+        for block_hash in request.block_hashes
+    ]
+    assert event.token_ids == [0, 1, 2, 3]
+    assert event.lookahead_token_ids == [
+        token_ids[end : end + lookahead] for end in (2, 4)
+    ]
+    reconstructed_hashes = []
+    parent_hash = event.parent_block_hash
+    assert event.extra_keys is not None
+    for block_start, extra_keys, lookahead_token_ids in zip(
+        range(0, len(event.token_ids), block_size),
+        event.extra_keys,
+        event.lookahead_token_ids,
+        strict=True,
+    ):
+        parent_hash = kv_cache_utils.hash_block_tokens(
+            sha256,
+            parent_hash,
+            event.token_ids[block_start : block_start + block_size],
+            (extra_keys, *lookahead_token_ids),
+        )
+        reconstructed_hashes.append(parent_hash)
+    assert reconstructed_hashes == request.block_hashes
+
+
+@pytest.mark.parametrize(
+    "lookahead,prompt_len,expected_boundary",
+    [
+        (0, 1089, 1088),
+        (1, 1089, 1088),
+        (2, 1089, 1024),
+        (2, 1090, 1088),
+        (3, 1089, 1024),
+        (3, 1091, 1088),
+    ],
+)
+@pytest.mark.parametrize("checkpoint_blocks", [0, 1])
+@pytest.mark.parametrize("full_block_size", [64, 128])
+def test_lookahead_checkpoint_has_available_hash(
+    lookahead, prompt_len, expected_boundary, checkpoint_blocks, full_block_size
+):
+    """Prefill checkpoints must be reusable at the boundary their hash proves."""
+    config = _make_hybrid_kv_cache_config(64, 100, ["full", "mamba", "full"])
+    config.kv_cache_groups[0].kv_cache_spec = replace(
+        config.kv_cache_groups[0].kv_cache_spec, block_size=full_block_size
+    )
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec,
+        block_size=512,
+        num_prefill_checkpoint_blocks=checkpoint_blocks,
+        prefill_checkpoint_alignment=64 if checkpoint_blocks else None,
+    )
+    config.kv_cache_groups[2].is_eagle_group = bool(lookahead)
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=4096,
+        enable_caching=True,
+        hash_block_size=64,
+        num_prefill_lookahead=lookahead,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    tokens = list(range(prompt_len))
+    request = make_request(
+        "producer", tokens, 64, sha256, num_hash_lookahead_tokens=lookahead
+    )
+    if not checkpoint_blocks:
+        assert manager.allocate_slots(request, expected_boundary) is not None
+        request.num_computed_tokens = expected_boundary
+        manager.new_step_starts()
+    assert manager.allocate_slots(request, len(tokens) - request.num_computed_tokens)
+    checkpoint_hash = request.block_hashes[expected_boundary // 64 - 1]
+    blocks = manager.block_pool.get_cached_block(checkpoint_hash, [1])
+    assert blocks is not None
+    assert blocks[0].block_hash_num_tokens == expected_boundary
+    if checkpoint_blocks:
+        offsets, cols = compute_mamba_prefill_checkpoints(
+            [prompt_len],
+            [prompt_len],
+            hash_block_size=64,
+            mamba_block_size=512,
+            checkpoint_alignment=64,
+            drop_eagle_block=False,
+            cache_hit_alignment_tokens=64,
+            num_hash_lookahead_tokens=lookahead,
+        )
+        assert offsets == [expected_boundary]
+        assert (
+            blocks[0].block_id == manager.get_block_ids(request.request_id)[1][cols[0]]
+        )
+
+    request.num_computed_tokens = len(tokens)
+    manager.free(request)
+    manager.new_step_starts()
+    replay = make_request(
+        "replay", tokens, 64, sha256, num_hash_lookahead_tokens=lookahead
+    )
+    _, hit_tokens, _ = manager.get_computed_blocks(replay)
+    assert hit_tokens == expected_boundary
+
+
+def test_eagle_hybrid_mamba_hits_partial_prompt_boundary():
+    hash_block_size = 16
+    mamba_block_size = 544
+    token_ids = list(range(1249))
+    config = _make_hybrid_kv_cache_config(hash_block_size, 200, ["full", "mamba"])
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec, block_size=mamba_block_size
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=False,
+        num_hash_lookahead_tokens=1,
+        hash_block_size=hash_block_size,
+    )
+
+    first = make_request(
+        "first",
+        token_ids,
+        hash_block_size,
+        sha256,
+        num_hash_lookahead_tokens=1,
+    )
+    assert manager.allocate_slots(first, 1248) is not None
+    first.num_computed_tokens = 1248
+    manager.new_step_starts()
+    assert manager.allocate_slots(first, 1) is not None
+    first.num_computed_tokens = 1249
+    manager.new_step_starts()
+    manager.free(first)
+
+    second = make_request(
+        "second",
+        token_ids,
+        hash_block_size,
+        sha256,
+        num_hash_lookahead_tokens=1,
+    )
+    _, num_computed, _ = manager.get_computed_blocks(second)
+
+    assert num_computed == 1248
+    # Per-group lookup must not add the legacy EAGLE drop margin.
+    _, per_group_hits = manager.coordinator.find_longest_cache_hit_per_group(
+        second.block_hashes, 2 * hash_block_size
+    )
+    assert per_group_hits[0] == 2 * hash_block_size
+
+
+@pytest.mark.parametrize("lookahead", [0, 1, 2])
+@pytest.mark.parametrize("diverge_offset", [0, 1, 2])
+def test_mamba_partial_hit_requires_matching_lookahead_tokens(
+    lookahead: int, diverge_offset: int
+):
+    """A partial Mamba hit at boundary b also needs tokens [b, b + lookahead)."""
+    hash_block_size = 16
+    mamba_block_size = 544
+    prompt_len = 1249
+    config = _make_hybrid_kv_cache_config(hash_block_size, 200, ["full", "mamba"])
+    config.kv_cache_groups[1].kv_cache_spec = replace(
+        config.kv_cache_groups[1].kv_cache_spec, block_size=mamba_block_size
+    )
+    manager = make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        use_eagle=False,
+        num_hash_lookahead_tokens=lookahead,
+        hash_block_size=hash_block_size,
+    )
+    boundary = (prompt_len - max(1, lookahead)) // hash_block_size * hash_block_size
+    assert boundary % mamba_block_size != 0
+
+    token_ids = list(range(prompt_len))
+    producer = make_request(
+        "producer",
+        token_ids,
+        hash_block_size,
+        sha256,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    for chunk_end in (boundary, prompt_len):
+        assert (
+            manager.allocate_slots(producer, chunk_end - producer.num_computed_tokens)
+            is not None
+        )
+        producer.num_computed_tokens = chunk_end
+        manager.new_step_starts()
+    manager.free(producer)
+
+    shared_len = boundary + diverge_offset
+    consumer_ids = token_ids[:shared_len] + [
+        100_000 + i for i in range(prompt_len + hash_block_size - shared_len)
+    ]
+    consumer = make_request(
+        "consumer",
+        consumer_ids,
+        hash_block_size,
+        sha256,
+        num_hash_lookahead_tokens=lookahead,
+    )
+    _, num_computed, _ = manager.get_computed_blocks(consumer)
+    # No Mamba state is retained below the prompt's partial boundary.
+    assert num_computed == (boundary if diverge_offset >= lookahead else 0)
 
 
 def test_eagle_with_sliding_window():
@@ -5181,6 +5465,51 @@ def test_hybrid_mamba_retention_mtp_resend_of_aligned_prompt():
     assert num_computed_tokens == 3 * block_size
 
 
+def test_hybrid_mamba_retention_lookahead_keeps_last_prompt_boundary():
+    """Sparse retention keeps the last boundary covered by lookahead hashes."""
+    block_size = 32
+    kv_cache_config = _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"])
+    kv_cache_config.kv_cache_groups[1].kv_cache_spec = replace(
+        kv_cache_config.kv_cache_groups[1].kv_cache_spec,
+        num_speculative_blocks=1,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=0,
+        use_eagle=False,
+        num_hash_lookahead_tokens=1,
+    )
+
+    # 129 tokens: the last boundary below the logits token is 128.
+    token_ids = [i for i in range(4) for _ in range(block_size)] + [4]
+    req0 = make_request("0", token_ids, block_size, sha256, num_hash_lookahead_tokens=1)
+    for chunk_end in (32, 64, 96, 128, 129):
+        blocks = manager.allocate_slots(
+            req0,
+            chunk_end - req0.num_computed_tokens,
+            num_lookahead_tokens=1,
+        )
+        assert blocks is not None
+        req0.num_computed_tokens = chunk_end
+
+    pool = manager.block_pool
+    for i in range(4):
+        cached = pool.get_cached_block(req0.block_hashes[i], kv_cache_group_ids=[1])
+        if i == 3:
+            assert cached is not None, "mamba state at 128 should be retained"
+        else:
+            assert cached is None, f"mamba hash {i} should not be cached"
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256, num_hash_lookahead_tokens=1)
+    computed_blocks, num_computed_tokens, _ = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 4 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [4, 4]
+
+
 def test_block_lookup_cache_single_block_per_key():
     cache = BlockHashToBlockMap()
     key0 = BlockHashWithGroupId(b"hash0")
@@ -5899,6 +6228,44 @@ def test_mamba_reachable_block_mask_pins_shared_prefix():
     assert retained(0, None) == {14}
 
 
+def test_mamba_align_siblings_hit_committed_boundary_in_one_step():
+    """Requests that hit a Mamba state committed in an earlier step must not
+    defer each other. Re-caching that boundary through the prompt-tail path
+    used to mark its hash as cached in the current step, so every sibling
+    sharing the boundary was refused until the next step and siblings ran one
+    per engine step (e.g. many reads over one shared prompt)."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba"]),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+    shared = [7] * (2 * block_size)
+
+    # Step 1: the producer prefills up to the end of the shared prefix, which
+    # commits the Mamba state at that block boundary.
+    manager.new_step_starts()
+    producer = make_request("p", shared + [50] * 8, block_size, sha256)
+    blocks, num_computed, _ = manager.get_computed_blocks(producer)
+    assert num_computed == 0
+    assert manager.allocate_slots(producer, 2 * block_size, num_computed, blocks)
+    producer.num_computed_tokens = 2 * block_size
+
+    # Step 2: the producer finishes its prompt, and siblings that share the
+    # committed boundary are all admitted in the same step.
+    manager.new_step_starts()
+    assert manager.allocate_slots(producer, 8) is not None
+    for i, tail in enumerate((60, 70, 80)):
+        sibling = make_request(f"s{i}", shared + [tail] * 8, block_size, sha256)
+        blocks, num_computed, _ = manager.get_computed_blocks(sibling)
+        assert num_computed == 2 * block_size
+        new_blocks = manager.allocate_slots(
+            sibling, len(sibling.all_token_ids) - num_computed, num_computed, blocks
+        )
+        assert new_blocks is not None, f"sibling {i} was deferred"
+
+
 def test_mamba_shared_prefix_reuse_under_zero_retention():
     """Full cross-request Marconi flow: a partial shared prefix cached by the
     detecting request must stay reusable by a later request under
@@ -6288,3 +6655,465 @@ def test_get_unhashed_block_ids_all_groups():
     )
 
     assert blocks.get_unhashed_block_ids_all_groups() == [[1, 4], []]
+
+
+@pytest.fixture
+def qsa_hisparse_manager():
+    """Build real QSA groups with complete K/V and the default hot capacity."""
+    from vllm.config import HiSparseConfig, KVTransferConfig
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+    from vllm.v1.core.kv_cache_utils import (
+        generate_scheduler_kv_cache_config,
+        init_none_hash,
+    )
+    from vllm.v1.kv_cache_interface import (
+        HiSparseHotSpec,
+        HiSparseResidentSpec,
+        MLAAttentionSpec,
+        SparseCacheRole,
+        SparseFullAttentionSpec,
+    )
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+
+    init_none_hash(sha256)
+    specs = {}
+    for layer in range(2):
+        name = f"model.layers.{layer}.self_attn"
+        specs[name] = SparseFullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            total_num_kv_heads=2,
+            head_size=32,
+            head_size_v=32,
+            dtype=torch.bfloat16,
+            top_k=35,
+        )
+        specs[f"{name}.indexer"] = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=16,
+            dtype=torch.bfloat16,
+            tokens_per_state=4,
+            cache_role=SparseCacheRole.INDEXER,
+        )
+    config = SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=HiSparseConfig()),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(), max_model_len=128),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=2,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            world_size=2,
+            distributed_executor_backend="mp",
+            nnodes_within_dp=1,
+        ),
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=64,
+            prefix_cache_retention_interval=None,
+            mamba_cache_mode="none",
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLNHC,
+        ),
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=None,
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="HiSparseConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"host_pool_gib": 1 / 2048},
+        ),
+    )
+    cache = get_kv_cache_config_from_groups(
+        config,
+        get_kv_cache_groups(config, specs),
+        available_memory=2**20,
+    )
+    # Two layers x 16 tokens x 2 unique heads x K/V x 32 dims x BF16:
+    # 8192 logical bytes/block; each rank owns 4096 bytes across both layers.
+    assert cache.hisparse_host_num_blocks == 64
+    assert cache.hisparse_host_block_stride == 4096
+    assert cache.hisparse_shared_host_pool is False
+    resident = [
+        group.kv_cache_spec
+        for group in cache.kv_cache_groups
+        if isinstance(group.kv_cache_spec, HiSparseResidentSpec)
+    ]
+    hot = [
+        group.kv_cache_spec
+        for group in cache.kv_cache_groups
+        if isinstance(group.kv_cache_spec, HiSparseHotSpec)
+    ]
+    assert len(resident) == len(hot) == 2
+    assert all(spec.page_size_bytes == 2048 for spec in resident + hot)
+    # Default 2 x top_k = 70 logical hot rows occupy five 16-token blocks.
+    assert all(spec.blocks_per_request == 5 for spec in hot)
+    # EngineCore derives scheduler specs from worker configs before creating
+    # KVCacheManager; worker UniformTypeKVCacheSpecs are not manager specs.
+    scheduler_cache = generate_scheduler_kv_cache_config([cache, cache])
+    return make_kv_cache_manager(
+        scheduler_cache,
+        max_model_len=128,
+        enable_caching=False,
+        hash_block_size=16,
+    )
+
+
+def _qsa_request(name, first_token=0):
+    from vllm.utils.hashing import sha256
+
+    return make_request(name, list(range(first_token, first_token + 16)), 16, sha256)
+
+
+def _qsa_connector(manager):
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
+        HiSparseConnectorScheduler,
+    )
+    from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
+
+    coordinator = get_hisparse_coordinator(manager)
+    connector = HiSparseConnectorScheduler(async_speculative=False)
+    connector.bind_coordinator(coordinator)
+    return connector, coordinator
+
+
+def _qsa_worker_update(connector, *rank_messages):
+    """Use the production rank aggregation and scheduler connector boundary."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector import (
+        HiSparseConnectorWorkerMetadata,
+    )
+    from vllm.v1.outputs import KVConnectorOutput
+
+    metadata = HiSparseConnectorWorkerMetadata({}, {})
+    for enqueued, completed in rank_messages:
+        metadata = metadata.aggregate(
+            HiSparseConnectorWorkerMetadata(
+                {transfer_id: 1 for transfer_id in enqueued},
+                {transfer_id: 1 for transfer_id in completed},
+            )
+        )
+    connector.update_connector_output(
+        KVConnectorOutput(kv_connector_worker_meta=metadata)
+    )
+
+
+def test_qsa_partial_prefix_cow_restores_a_private_writable_tail(
+    qsa_hisparse_manager,
+):
+    """A real 640-token hit preserves its 64-row tail before B can write it."""
+    page_size = 576
+    cache = qsa_hisparse_manager.kv_cache_config
+    groups = []
+    for group in cache.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, (HiSparseResidentSpec, HiSparseHotSpec)):
+            spec = replace(
+                spec,
+                block_size=page_size,
+                page_size=spec.page_size_bytes * page_size // spec.block_size,
+            )
+        else:
+            padded = spec.page_size_padded
+            spec = replace(
+                spec,
+                block_size=page_size,
+                page_size_padded=(
+                    padded * page_size // spec.block_size if padded else None
+                ),
+            )
+        groups.append(replace(group, kv_cache_spec=spec))
+    groups.append(
+        KVCacheGroupSpec(
+            ["mamba"],
+            MambaSpec(
+                block_size=page_size,
+                shapes=(1, 1),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            ),
+        )
+    )
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=128,
+            kv_cache_tensors=[],
+            kv_cache_groups=groups,
+            hisparse_host_num_blocks=64,
+        ),
+        max_model_len=4096,
+        enable_caching=True,
+        hash_block_size=64,
+    )
+    connector, coordinator = _qsa_connector(manager)
+    host_pool = coordinator.get_host_block_pool()
+    assert host_pool is not None
+    initial_free = (
+        manager.block_pool.get_num_free_blocks(),
+        host_pool.get_num_free_blocks(),
+    )
+
+    def build_metadata(request, count, new_blocks):
+        connector.requests[request.request_id] = request
+        output = SchedulerOutput.make_empty()
+        output.scheduled_cached_reqs.req_ids = [request.request_id]
+        output.scheduled_cached_reqs.num_computed_tokens = [request.num_computed_tokens]
+        output.scheduled_cached_reqs.new_block_ids = [new_blocks.get_block_ids()]
+        output.num_scheduled_tokens = {request.request_id: count}
+        output.total_num_scheduled_tokens = count
+        copies, retained = manager.take_kv_cache_block_copies()
+        output.kv_cache_block_copies = copies or None
+        return connector.build_connector_meta(output), retained
+
+    def complete_metadata(metadata):
+        counts = {
+            transfer.transfer_id: 2 for transfer in metadata.command.page_transfers
+        }
+        connector.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=HiSparseConnectorWorkerMetadata(
+                    counts,
+                    counts,
+                    tuple(copy.dst_block_id for copy in metadata.host_block_copies),
+                )
+            )
+        )
+
+    producer = make_request("producer", list(range(641)), 64, sha256)
+    for count in (576, 64, 1):
+        manager.new_step_starts()
+        allocated = manager.allocate_slots(producer, count)
+        assert allocated is not None
+        metadata, retained = build_metadata(producer, count, allocated)
+        complete_metadata(metadata)
+        manager.block_pool.free_blocks(retained)
+        producer.num_computed_tokens += count
+
+    original = manager.get_blocks(producer.request_id).blocks
+    original_ids = manager.get_block_ids(producer.request_id)
+    source_tail = original[coordinator.host_group_id][1]
+    resident_groups = [
+        i
+        for i, group in enumerate(groups)
+        if isinstance(group.kv_cache_spec, HiSparseResidentSpec)
+    ]
+    assert len(resident_groups) == 2
+    original_tails = tuple(original[i][1] for i in resident_groups)
+    consumer = make_request(
+        "consumer", list(range(640)) + list(range(1000, 1017)), 64, sha256
+    )
+    manager.new_step_starts()
+    hit_blocks, hit_tokens, _ = manager.get_computed_blocks(consumer)
+    assert hit_tokens == 640
+    assert hit_blocks.blocks[coordinator.host_group_id][1] is source_tail
+    allocated = manager.allocate_slots(consumer, 16, hit_tokens, hit_blocks)
+    assert allocated is not None
+    consumer.num_computed_tokens = hit_tokens
+    metadata, retained = build_metadata(consumer, 16, allocated)
+    current = manager.get_blocks(consumer.request_id).blocks
+    private_host = current[coordinator.host_group_id][1]
+    private_tails = tuple(current[i][1] for i in resident_groups)
+
+    assert private_host is not source_tail and not private_host.is_null
+    assert [
+        (copy.src_block_id, copy.dst_block_id) for copy in metadata.host_block_copies
+    ] == [(source_tail.block_id, private_host.block_id)]
+    assert all(not block.is_null for block in private_tails), (
+        "A partial local prefix hit must allocate every owner's writable tail"
+    )
+    assert all(new is not old for new, old in zip(private_tails, original_tails))
+    residency = metadata.residency_updates[consumer.request_id]
+    assert residency.pages == [0, 1]
+    assert residency.block_ids == tuple(
+        [original[group_id][0].block_id, tail.block_id]
+        for group_id, tail in zip(resident_groups, private_tails)
+    )
+    assert all(current[group_id][0].is_null for group_id in resident_groups)
+    assert coordinator.take_residency_updates([consumer.request_id]) == {}
+    restores = [
+        transfer for transfer in metadata.command.page_transfers if transfer.restore
+    ]
+    assert len(restores) == 1, "The inherited 64 rows need a pre-forward restore"
+    restore = restores[0]
+    assert not restore.after_forward
+    assert restore.host_block_id == private_host.block_id
+    assert restore.resident_block_ids == tuple(
+        block.block_id for block in private_tails
+    )
+    (mirror,) = metadata.row_mirrors[consumer.request_id]
+    assert mirror.source_starts == tuple(
+        block.block_id * page_size + 64 for block in private_tails
+    )
+    assert mirror.destination_start == private_host.block_id * page_size + 64
+    assert mirror.num_rows == 16
+    assert manager.get_block_ids(producer.request_id) == original_ids
+    assert source_tail.ref_cnt >= 2 and private_host.ref_cnt >= 3
+    assert all(block.ref_cnt >= 2 for block in private_tails)
+
+    # The worker may acknowledge the COW before the restore completes.
+    connector.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=HiSparseConnectorWorkerMetadata(
+                {restore.transfer_id: 2}, {}, (private_host.block_id,)
+            )
+        )
+    )
+    assert source_tail.ref_cnt == 1
+    assert private_host.ref_cnt == 2
+    assert all(block.ref_cnt == 2 for block in private_tails)
+    _qsa_worker_update(connector, ([], [restore.transfer_id]))
+    assert private_host.ref_cnt == 2
+    assert all(block.ref_cnt == 2 for block in private_tails)
+    _qsa_worker_update(connector, ([], [restore.transfer_id]))
+    assert private_host.ref_cnt == 1
+    assert all(block.ref_cnt == 1 for block in private_tails)
+    manager.block_pool.free_blocks(retained)
+    assert not coordinator.has_pending_work()
+    manager.free(consumer)
+    assert manager.get_block_ids(producer.request_id) == original_ids
+    assert source_tail.ref_cnt == 1
+    manager.free(producer)
+    assert (
+        manager.block_pool.get_num_free_blocks(),
+        host_pool.get_num_free_blocks(),
+    ) == initial_free
+
+
+def test_qsa_private_tp2_partial_ack_keeps_both_kv_layers_and_host_unpublished(
+    qsa_hisparse_manager,
+):
+    """One rank's completion cannot release either layer or publish host KV."""
+    manager = qsa_hisparse_manager
+    connector, coordinator = _qsa_connector(manager)
+    initial_free = (
+        manager.block_pool.get_num_free_blocks(),
+        coordinator.host_manager.block_pool.get_num_free_blocks(),
+    )
+    request = _qsa_request("request")
+    assert _allocate_scheduled(manager, request, num_new_tokens=16) is not None
+    (transfer,) = coordinator.build_offload_command().page_transfers
+    state = coordinator.request_states[request.request_id]
+    host = coordinator.host_manager.req_to_blocks[request.request_id][0]
+    resident = tuple(
+        layer.req_to_blocks[request.request_id][0]
+        for layer in coordinator.resident_managers
+    )
+    endpoints = (host, *resident)
+    assert len(resident) == 2
+    assert all(block.ref_cnt == 2 for block in endpoints)
+
+    # Both private writers enqueue, but only rank 0 reports completion.
+    _qsa_worker_update(
+        connector,
+        ([transfer.transfer_id], [transfer.transfer_id]),
+        ([transfer.transfer_id], []),
+    )
+    assert all(block.ref_cnt == 2 for block in endpoints)
+    assert state.valid_pages == set()
+    assert state.ready_prefix_pages == 0
+    assert state.pending_pages == {0: transfer.transfer_id}
+    assert coordinator.has_pending_work()
+
+    _qsa_worker_update(connector, ([], [transfer.transfer_id]))
+    assert all(block.ref_cnt == 1 for block in endpoints)
+    assert state.valid_pages == {0}
+    assert state.ready_prefix_pages == 1
+    assert state.pending_pages == {}
+    assert not coordinator.has_pending_work()
+
+    # A repeated late metadata delivery must not release the request's own pin.
+    _qsa_worker_update(connector, ([], [transfer.transfer_id]))
+    assert all(block.ref_cnt == 1 for block in endpoints)
+    manager.free(request)
+    assert all(block.ref_cnt == 0 for block in endpoints)
+    assert (
+        manager.block_pool.get_num_free_blocks(),
+        coordinator.host_manager.block_pool.get_num_free_blocks(),
+    ) == initial_free
+
+
+def test_qsa_aborted_transfer_cannot_publish_into_recreated_request_state(
+    qsa_hisparse_manager,
+):
+    """Late completion releases old leases without changing a replacement request."""
+    from vllm.v1.request import RequestStatus
+
+    manager = qsa_hisparse_manager
+    connector, coordinator = _qsa_connector(manager)
+    initial_free = (
+        manager.block_pool.get_num_free_blocks(),
+        coordinator.host_manager.block_pool.get_num_free_blocks(),
+    )
+    old = _qsa_request("reused-request-id")
+    assert _allocate_scheduled(manager, old, num_new_tokens=16) is not None
+    (old_transfer,) = coordinator.build_offload_command().page_transfers
+    old_state = coordinator.request_states[old.request_id]
+    old_host = coordinator.host_manager.req_to_blocks[old.request_id][0]
+    old_resident = tuple(
+        layer.req_to_blocks[old.request_id][0]
+        for layer in coordinator.resident_managers
+    )
+    old_endpoints = (old_host, *old_resident)
+    _qsa_worker_update(
+        connector,
+        ([old_transfer.transfer_id], [old_transfer.transfer_id]),
+        ([old_transfer.transfer_id], []),
+    )
+
+    # Scheduler cancellation reaches this real KVCacheManager.free boundary.
+    old.status = RequestStatus.FINISHED_ABORTED
+    manager.free(old)
+    assert old.request_id not in coordinator.request_states
+    assert all(block.ref_cnt == 1 for block in old_endpoints)
+    assert coordinator.has_pending_work()
+
+    replacement = _qsa_request(old.request_id, first_token=1000)
+    assert _allocate_scheduled(manager, replacement, num_new_tokens=16) is not None
+    (new_transfer,) = coordinator.build_offload_command().page_transfers
+    new_state = coordinator.request_states[replacement.request_id]
+    new_host = coordinator.host_manager.req_to_blocks[replacement.request_id][0]
+    new_resident = tuple(
+        layer.req_to_blocks[replacement.request_id][0]
+        for layer in coordinator.resident_managers
+    )
+    new_endpoints = (new_host, *new_resident)
+    assert new_state is not old_state
+    assert new_transfer.transfer_id != old_transfer.transfer_id
+    assert {id(block) for block in old_endpoints}.isdisjoint(
+        id(block) for block in new_endpoints
+    )
+    assert all(block.ref_cnt == 2 for block in new_endpoints)
+
+    _qsa_worker_update(connector, ([], [old_transfer.transfer_id]))
+    assert all(block.ref_cnt == 0 for block in old_endpoints)
+    assert all(block.ref_cnt == 2 for block in new_endpoints)
+    assert old_state.pending_pages == {}
+    assert old_state.valid_pages == set()
+    assert coordinator.request_states[replacement.request_id] is new_state
+    assert new_state.valid_pages == set()
+    assert new_state.ready_prefix_pages == 0
+    assert new_state.pending_pages == {0: new_transfer.transfer_id}
+
+    # Re-delivery remains harmless after the original pending object disappeared.
+    _qsa_worker_update(connector, ([], [old_transfer.transfer_id]))
+    assert all(block.ref_cnt == 0 for block in old_endpoints)
+    assert all(block.ref_cnt == 2 for block in new_endpoints)
+    assert new_state.pending_pages == {0: new_transfer.transfer_id}
+    assert new_state.valid_pages == set()
+
+    _qsa_worker_update(
+        connector,
+        ([new_transfer.transfer_id], [new_transfer.transfer_id]),
+        ([new_transfer.transfer_id], [new_transfer.transfer_id]),
+    )
+    assert new_state.valid_pages == {0}
+    assert new_state.pending_pages == {}
+    assert all(block.ref_cnt == 1 for block in new_endpoints)
+    assert not coordinator.has_pending_work()
+    manager.free(replacement)
+    assert all(block.ref_cnt == 0 for block in (*old_endpoints, *new_endpoints))
+    assert (
+        manager.block_pool.get_num_free_blocks(),
+        coordinator.host_manager.block_pool.get_num_free_blocks(),
+    ) == initial_free

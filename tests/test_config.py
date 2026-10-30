@@ -4,6 +4,9 @@
 import json
 import logging
 import os
+import subprocess
+import sys
+import textwrap
 from dataclasses import MISSING, Field, asdict, dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -47,7 +50,7 @@ from vllm.config.mamba import MambaBackendEnum
 from vllm.config.speculative import _validate_qwen3_omni_dspark
 from vllm.config.utils import get_field
 from vllm.config.vllm import OPTIMIZATION_LEVEL_TO_CONFIG, OptimizationLevel
-from vllm.platforms import current_platform
+from vllm.platforms import Platform, PlatformEnum, current_platform
 from vllm.sampling_params import BeamSearchParams
 from vllm.transformers_utils.config import (
     _patch_hf_transformers_nested_rope_validation,
@@ -290,6 +293,7 @@ def test_lora_rejected_at_config_time_for_unsupported_model(supported):
     """Models without SupportsLoRA must fail during config validation with a
     clear message, not with a bare assert inside the model constructor."""
     model_config = SimpleNamespace(
+        runner_type="generate",
         is_lora_supported=supported,
         architecture="Zamba2ForCausalLM",
         architectures=["Zamba2ForCausalLM"],
@@ -304,6 +308,22 @@ def test_lora_rejected_at_config_time_for_unsupported_model(supported):
             ValueError, match="LoRA is not supported for Zamba2ForCausalLM"
         ):
             lora_config.verify_with_model_config(model_config)
+
+
+def test_lora_allowed_for_drafter_without_lora_support():
+    """Speculative decoding re-validates the config with the draft model's
+    config, and drafters don't run LoRA adapters."""
+    draft_config = SimpleNamespace(
+        runner_type="draft",
+        is_lora_supported=False,
+        architecture="DeepSeekMTPModel",
+        architectures=["DeepSeekMTPModel"],
+        model="deepseek-ai/DeepSeek-V3",
+        dtype=torch.bfloat16,
+    )
+    lora_config = LoRAConfig()
+    lora_config.verify_with_model_config(draft_config)
+    assert lora_config.lora_dtype == torch.bfloat16
 
 
 def test_mamba_cache_mode_all_is_rejected():
@@ -332,6 +352,27 @@ def test_mismatched_float_kv_cache_is_rejected(cache_dtype, model_dtype, should_
             config._reject_mismatched_float_kv_cache()
     else:
         config._reject_mismatched_float_kv_cache()
+
+
+@pytest.mark.parametrize("dcp_size", [1, 2])
+def test_nvfp4_ds_mla_rejects_decode_context_parallelism(dcp_size):
+    # The nvfp4_ds_mla chunked-context gather is not validated under DCP, so
+    # the combination fails at startup instead of on the first request that
+    # carries cached context.
+    kwargs = dict(
+        cache_config=CacheConfig(cache_dtype="nvfp4_ds_mla"),
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=dcp_size,
+            distributed_executor_backend="mp",
+        ),
+    )
+    if dcp_size > 1:
+        with pytest.raises(ValueError, match="decode context parallelism"):
+            VllmConfig(**kwargs)
+    else:
+        VllmConfig(**kwargs)
 
 
 def test_per_request_spec_decode_metrics_requires_spec_decode():
@@ -387,11 +428,9 @@ def test_pd_dcp_interleave_size_is_adjusted_to_block_size(
         kv_transfer_config=kv_transfer_config,
     )
 
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
-    )
+    kv_cache_groups = [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
     with caplog.at_level(logging.INFO):
-        config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+        config.adjust_dcp_kv_cache_interleave_size(kv_cache_groups)
 
     assert config.parallel_config.cp_kv_cache_interleave_size == 16
     assert "automatically adjusted from 3 to block_size 16" in caplog.text
@@ -413,10 +452,26 @@ def test_kv_offloading_does_not_adjust_dcp_interleave_size():
         ),
     )
 
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    kv_cache_groups = [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    config.adjust_dcp_kv_cache_interleave_size(kv_cache_groups)
+
+    assert config.parallel_config.cp_kv_cache_interleave_size == 1
+
+
+def test_empty_kv_cache_groups_preserve_dcp_interleave_size():
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
+            distributed_executor_backend="mp",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector", kv_role="kv_both"
+        ),
     )
-    config.adjust_dcp_kv_cache_interleave_size(kv_cache_config)
+
+    config.adjust_dcp_kv_cache_interleave_size([])
 
     assert config.parallel_config.cp_kv_cache_interleave_size == 1
 
@@ -511,6 +566,48 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
 
 
+@pytest.mark.parametrize("platform_enum", list(PlatformEnum))
+@pytest.mark.parametrize("has_triton", [False, True])
+def test_model_runner_default_preserves_backend_fallback(
+    monkeypatch, platform_enum, has_triton
+):
+    platform = Platform()
+    platform._enum = platform_enum
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    monkeypatch.setattr(vllm_config_module, "current_platform", platform)
+    monkeypatch.setattr(vllm_config_module, "HAS_TRITON", has_triton)
+
+    config = VllmConfig()
+    assert config.use_v2_model_runner == (has_triton or platform.is_unspecified())
+
+
+def test_v2_frontend_config_can_be_created_without_triton():
+    # Start fresh so config imports observe the frontend's Triton availability.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+                import os
+                import vllm.platforms as platforms
+                from vllm.platforms.interface import UnspecifiedPlatform
+
+                platforms._current_platform = UnspecifiedPlatform()
+                platforms._current_platform.device_type = "cpu"
+                import vllm.triton_utils
+
+                os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+                vllm.triton_utils.HAS_TRITON = False
+                from vllm.config import VllmConfig
+
+                config = VllmConfig()
+                assert config.use_v2_model_runner
+            """),
+        ],
+        check=True,
+    )
+
+
 def test_hisparse_requires_v2_model_runner():
     config = object.__new__(VllmConfig)
     config.attention_config = AttentionConfig(hisparse_config=HiSparseConfig())
@@ -524,8 +621,133 @@ def test_hisparse_requires_v2_model_runner():
         _ = config.use_v2_model_runner
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="QSA requires NVIDIA CUDA")
+@pytest.mark.parametrize(
+    ("model_kind", "layer_type", "supported"),
+    [
+        ("qsa", "full_attention", True),
+        ("wrapped_qsa", "full_attention", True),
+        ("qsa_mtp", "full_attention", True),
+        ("qsa_mtp_full_async", "full_attention", True),
+        ("qsa_mtp_full_async_fp8", "full_attention", True),
+        ("dense_qwen4", "full_attention", False),
+        ("other_indexer", "full_attention", False),
+    ],
+)
+def test_hisparse_accepts_only_supported_qsa_models(
+    tmp_path: Path, model_kind: str, layer_type: str, supported: bool
+):
+    """Local QSA configs need no DSA alias; indexer fields alone are not enough."""
+    from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
+    from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+
+    from vllm.engine.arg_utils import EngineArgs
+
+    use_mtp = model_kind.startswith("qsa_mtp")
+    full_async = model_kind.startswith("qsa_mtp_full_async")
+    fp8 = model_kind.endswith("_fp8")
+    fields = dict(
+        architectures=["Qwen4ExpForCausalLM"],
+        num_hidden_layers=1,
+        layer_types=[layer_type],
+        hidden_size=256,
+        intermediate_size=512,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        ple_layer_ids=[],
+    )
+    if use_mtp:
+        fields["mtp_num_hidden_layers"] = 1
+    if model_kind != "dense_qwen4":
+        fields.update(
+            indexer_n_heads=8,
+            indexer_kv_heads=1,
+            indexer_head_dim=128,
+            indexer_compress_ratio=4,
+            indexer_budget=2048,
+        )
+    if model_kind == "other_indexer":
+        fields["architectures"] = ["Qwen3NextForCausalLM"]
+        hf_config = Qwen3NextConfig(**fields)
+    else:
+        hf_config = Qwen4ExpTextConfig(**fields)
+        if model_kind == "wrapped_qsa":
+            hf_config = Qwen4ExpConfig(
+                architectures=["Qwen4ExpForConditionalGeneration"],
+                text_config=hf_config,
+            )
+    hf_config.save_pretrained(tmp_path)
+    args = EngineArgs(
+        model=str(tmp_path),
+        load_format="dummy",
+        skip_tokenizer_init=True,
+        language_model_only=True,
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_batched_tokens=128,
+        max_num_seqs=2,
+        enforce_eager=not full_async,
+        async_scheduling=full_async,
+        kv_cache_dtype="fp8" if fp8 else "auto",
+        compilation_config=(
+            {"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes": [4]}
+            if full_async
+            else {}
+        ),
+        enable_prefix_caching=False,
+        enable_chunked_prefill=False,
+        disable_hybrid_kv_cache_manager=False,
+        attention_config=AttentionConfig(
+            hisparse_config=HiSparseConfig(), indexer_kv_dtype="fp8" if fp8 else "bf16"
+        ),
+        speculative_config=(
+            {
+                "method": "mtp",
+                "num_speculative_tokens": 3,
+                "index_share_for_mtp_iteration": True,
+            }
+            if use_mtp
+            else None
+        ),
+    )
+    if supported:
+        config = args.create_engine_config()
+        assert config.attention_config.hisparse_config is not None
+        assert not hasattr(config.model_config.hf_config, "index_topk")
+        if use_mtp:
+            from vllm.models.qwen4_exp.nvidia.mtp import _make_draft_vllm_config
+
+            draft = _make_draft_vllm_config(config, mtp_start_layer_idx=1)
+            assert draft.model_config.hf_config.model_type == "qwen4_exp_mtp"
+            assert draft.attention_config.hisparse_config is not None
+            for candidate in (config, draft):
+                assert candidate.cache_config.cache_dtype == ("fp8" if fp8 else "auto")
+                assert candidate.attention_config.indexer_kv_dtype == (
+                    "fp8" if fp8 else "bf16"
+                )
+                assert candidate.scheduler_config.async_scheduling == full_async
+                if full_async:
+                    assert (
+                        candidate.compilation_config.cudagraph_mode.decode_mode()
+                        == (CUDAGraphMode.FULL)
+                    )
+                    assert not candidate.model_config.enforce_eager
+            assert config.speculative_config.num_speculative_tokens == 3
+            assert config.speculative_config.index_share_for_mtp_iteration
+    else:
+        with pytest.raises(ValueError, match="HiSparse is only supported"):
+            args.create_engine_config()
+
+
 def test_hisparse_rejects_decode_context_parallelism(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
     monkeypatch.setattr(current_platform, "device_count", lambda: 2)
     with pytest.raises(ValueError, match="decode context parallelism"):
         VllmConfig(
@@ -538,7 +760,11 @@ def test_hisparse_rejects_decode_context_parallelism(monkeypatch):
 
 
 def test_hisparse_rejects_pipeline_parallelism(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
     monkeypatch.setattr(current_platform, "device_count", lambda: 2)
     with pytest.raises(ValueError, match="pipeline parallelism"):
         VllmConfig(
@@ -548,7 +774,11 @@ def test_hisparse_rejects_pipeline_parallelism(monkeypatch):
 
 
 def test_hisparse_rejects_full_cudagraph_mode(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
     monkeypatch.setattr(current_platform, "support_static_graph_mode", lambda: True)
     monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
     with pytest.raises(ValueError, match="does not support cudagraph_mode=FULL"):
@@ -559,7 +789,11 @@ def test_hisparse_rejects_full_cudagraph_mode(monkeypatch):
 
 
 def test_hisparse_rejects_disabled_hybrid_kv_cache_manager(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
     monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
     with pytest.raises(ValueError, match="requires the hybrid KV cache manager"):
         VllmConfig(
@@ -573,7 +807,11 @@ def test_hisparse_rejects_disabled_hybrid_kv_cache_manager(monkeypatch):
 
 
 def test_hisparse_rejects_disabled_full_isl_reservation(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
     with pytest.raises(ValueError, match="requires --scheduler-reserve-full-isl"):
         VllmConfig(
             attention_config=AttentionConfig(hisparse_config=HiSparseConfig()),
@@ -585,9 +823,9 @@ def test_hisparse_rejects_disabled_full_isl_reservation(monkeypatch):
         )
 
 
-def test_hisparse_rejects_non_cuda(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
-    with pytest.raises(ValueError, match="requires NVIDIA CUDA"):
+def test_hisparse_rejects_unsupported_platform(monkeypatch):
+    monkeypatch.setattr(current_platform, "get_hisparse_backend_cls", lambda: None)
+    with pytest.raises(ValueError, match="platform does not support HiSparse"):
         VllmConfig(attention_config=AttentionConfig(hisparse_config=HiSparseConfig()))
 
 
@@ -635,7 +873,11 @@ def test_hisparse_rejects_non_cuda(monkeypatch):
     ids=["standalone", "multi-connector", "pd-decode"],
 )
 def test_hisparse_connector_implies_attention_config(monkeypatch, kv_transfer_config):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
     monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
     config = VllmConfig(
         kv_transfer_config=kv_transfer_config,
@@ -651,7 +893,11 @@ def test_hisparse_connector_implies_attention_config(monkeypatch, kv_transfer_co
 
 
 def test_hisparse_connector_preserves_explicit_attention_config(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "get_hisparse_backend_cls",
+        lambda: "vllm.v1.hisparse.backend.CUDAHiSparseBackend",
+    )
     monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", True)
     config = VllmConfig(
         attention_config=AttentionConfig(
@@ -671,9 +917,9 @@ def test_hisparse_connector_preserves_explicit_attention_config(monkeypatch):
     assert config.attention_config.hisparse_config.device_buffer_size == 512
 
 
-def test_hisparse_connector_without_cuda_still_rejected(monkeypatch):
-    monkeypatch.setattr(current_platform, "is_cuda", lambda: False)
-    with pytest.raises(ValueError, match="requires NVIDIA CUDA"):
+def test_hisparse_connector_with_unsupported_platform_rejected(monkeypatch):
+    monkeypatch.setattr(current_platform, "get_hisparse_backend_cls", lambda: None)
+    with pytest.raises(ValueError, match="platform does not support HiSparse"):
         VllmConfig(
             kv_transfer_config=KVTransferConfig(
                 kv_connector="HiSparseConnector",
@@ -1799,6 +2045,23 @@ def test_deepseek_engram_rejects_microbatching(explicit, enable_dbo, ubatch_size
         ValueError, match="Engram does not support DBO or microbatching"
     ):
         VllmConfig._resolve_and_verify_engram_config(config)
+
+
+@pytest.mark.parametrize("threshold,expected", [(7, 8), (8, 8), (16, 16)])
+def test_dbo_thresholds_cover_a_request_per_microbatch(threshold, expected):
+    # Verifying 3 drafts: 4 tokens per request, so 2 microbatches need 8.
+    parallel_config = ParallelConfig(
+        enable_dbo=True,
+        dbo_decode_token_threshold=threshold,
+        dbo_prefill_token_threshold=threshold,
+    )
+    config = cast(
+        VllmConfig,
+        SimpleNamespace(uniform_decode_query_len=4, parallel_config=parallel_config),
+    )
+    VllmConfig._raise_dbo_thresholds_for_spec_decode(config)
+    assert parallel_config.dbo_decode_token_threshold == expected
+    assert parallel_config.dbo_prefill_token_threshold == expected
 
 
 def test_engram_explicit_config_requires_supported_model():
@@ -3587,8 +3850,14 @@ def test_draft_sample_method_probabilistic_is_accepted():
     assert speculative_config.draft_sample_method == "probabilistic"
 
 
+@pytest.mark.parametrize(
+    ("method", "drops_block"),
+    [("eagle3", True), ("mtp", True), ("dflash", False), ("dspark", False)],
+)
 @pytest.mark.parametrize("disable_eagle_block_drop", [False, True])
 def test_eagle_block_drop_can_be_disabled_without_disabling_eagle(
+    method: str,
+    drops_block: bool,
     disable_eagle_block_drop: bool,
 ):
     # Start from an ngram config to avoid loading model metadata: these predicates
@@ -3598,10 +3867,12 @@ def test_eagle_block_drop_can_be_disabled_without_disabling_eagle(
         num_speculative_tokens=3,
         disable_eagle_block_drop=disable_eagle_block_drop,
     )
-    speculative_config.method = "eagle3"
+    speculative_config.method = method
 
     assert speculative_config.use_eagle()
-    assert speculative_config.use_eagle_block_drop() is not disable_eagle_block_drop
+    assert speculative_config.use_eagle_block_drop() is (
+        drops_block and not disable_eagle_block_drop
+    )
 
 
 def test_draft_sample_method_gumbel_is_rejected():
@@ -3921,6 +4192,7 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     mock_draft.model = local_cache
     mock_draft.hf_config.model_type = "deepseek_mtp"
     mock_draft.hf_config.n_predict = None
+    mock_draft.hf_config.max_position_embeddings = 4096
     mock_draft.max_model_len = 4096
     mock_model_config_cls.return_value = mock_draft
 
@@ -3930,6 +4202,7 @@ def test_mtp_draft_uses_model_weights_not_local_cache(mock_model_config_cls):
     target_config.hf_text_config.model_type = "deepseek_v3"
     target_config.quantization = None
     target_config.max_model_len = 4096
+    target_config.using_transformers_backend.return_value = False
 
     SpeculativeConfig(
         method="mtp",

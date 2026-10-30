@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
@@ -20,13 +21,14 @@ from vllm.config import CacheConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import _layout_from_name
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d, np_to_pinned_tensor
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    SparseFullAttentionSpec,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +41,7 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -71,6 +74,37 @@ _LN_2 = math.log(2.0)
 def log2_lse_to_ln(lse: torch.Tensor) -> torch.Tensor:
     """Convert a base-2 log-sum-exp tensor to natural-log units."""
     return lse * _LN_2
+
+
+def compute_mm_prefix_ranges(
+    mm_features_per_req: Sequence[Sequence[MultiModalFeatureSpec]],
+    sliding_window: int | None = None,
+    clamp_sliding_window: bool = False,
+    span_pad: int = 0,
+) -> dict[int, list[tuple[int, int]]]:
+    """Per-request PrefixLM bidirectional ranges for image/video tokens."""
+    req_doc_ranges: dict[int, list[tuple[int, int]]] = {}
+    for req_idx, mm_features in enumerate(mm_features_per_req):
+        image_doc_ranges = []
+        for mm_feature in mm_features:
+            if mm_feature.modality not in ("image", "video"):
+                continue
+            pos_info = mm_feature.mm_position
+            if span_pad:
+                start = round_down(pos_info.offset, span_pad) + span_pad - 1
+                feature_ranges = [(start, pos_info.offset + pos_info.length - 1)]
+            else:
+                feature_ranges = pos_info.extract_embeds_range()
+            for r in feature_ranges:
+                if (
+                    not clamp_sliding_window
+                    and sliding_window is not None
+                    and (r[1] - r[0] + 1) > sliding_window
+                ):
+                    continue
+                image_doc_ranges.append(r)
+        req_doc_ranges[req_idx] = image_doc_ranges
+    return req_doc_ranges
 
 
 def compute_mm_prefix_range_tensor(
@@ -218,12 +252,21 @@ def get_supported_kv_cache_layouts(
     their order; otherwise the layout the most backends put first wins, ties
     keeping the enum order. An empty intersection is a hard error.
     """
-    supported_layouts_lists: list[Sequence[KVCacheLayout]] = [
-        layouts
-        for backend in backends
-        if (layouts := backend.supported_kv_cache_layouts()) is not None
-    ] or [_DEFAULT_LAYOUT_PREFERENCE]
+    return _merge_supported_layouts(
+        [
+            layouts
+            for backend in backends
+            if (layouts := backend.supported_kv_cache_layouts()) is not None
+        ]
+        or [_DEFAULT_LAYOUT_PREFERENCE]
+    )
 
+
+def _merge_supported_layouts(
+    supported_layouts_lists: Sequence[Sequence[KVCacheLayout]],
+) -> list[KVCacheLayout]:
+    """Layouts in every supported set, merged as in
+    ``get_supported_kv_cache_layouts``."""
     first = supported_layouts_lists[0]
     if all(layouts == first for layouts in supported_layouts_lists[1:]):
         return list(first)
@@ -265,9 +308,12 @@ def resolve_kv_cache_layout(
     """Resolve one KV cache layout for the whole model.
 
     Runs once in the engine core. Every worker reports the layouts its backends
-    support, most preferred first (``get_supported_kv_cache_layouts``); all
-    ranks run the same backends, so their lists must agree. Specs mixing HNC
-    shapes narrow the candidates to block-compact layouts. An explicit
+    support, most preferred first (``get_supported_kv_cache_layouts``). Pipeline
+    stages hold different layers, so their lists may differ; the candidates are
+    the layouts every worker supports, and the layout the most workers put first
+    wins. Workers whose backends declare nothing do not vote. Specs mixing HNC
+    shapes narrow the candidates to block-compact layouts. HiSparse full K/V
+    requires BLNHC so each token's heads form one contiguous copy row. An explicit
     ``VLLM_KV_CACHE_LAYOUT`` must be one of the candidates or resolution fails,
     with the legacy ``NHD``/``HND`` names as aliases for ``LBNHC``/``LBHNC``; the
     connector's preference is used when compatible and dropped with a warning
@@ -283,19 +329,34 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+    reported = [
+        tuple(_layout_from_name(name) for name in names) for names in supported_layouts
+    ]
+    # Workers where no backend declares a set report the default preference;
+    # like undeclared backends of one worker, they don't vote.
+    candidates = _merge_supported_layouts(
+        [layouts for layouts in reported if layouts != _DEFAULT_LAYOUT_PREFERENCE]
+        or reported
     )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    kv_cache_specs = tuple(kv_cache_specs or ())
+    if (
+        any(isinstance(spec, SparseFullAttentionSpec) for spec in kv_cache_specs)
+        and vllm_config.attention_config.hisparse_config is not None
+    ):
+        candidates = [layout for layout in candidates if layout is KVCacheLayout.BLNHC]
+        if not candidates:
+            raise ValueError(
+                "HiSparse sparse full attention requires BLNHC for contiguous "
+                "token rows, but it is not supported by every worker: "
+                f"{supported_layouts}."
+            )
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of
     # bytes is the same. If not block-compact, each spec must agree on HNC to alias
     # the same page (this aliasing is done by the Hybrid Memory Allocator, HMA).
     # Specs without per-layer views lay out their own raw backing tensor.
-    kv_cache_specs = tuple(
-        spec for spec in kv_cache_specs or () if spec.has_layer_views
-    )
+    kv_cache_specs = tuple(spec for spec in kv_cache_specs if spec.has_layer_views)
     hnc_shapes = {
         (spec.num_heads, spec.num_states, spec.page_size_bytes)
         for spec in kv_cache_specs
@@ -981,6 +1042,23 @@ def reorder_batch_to_split_decodes_and_prefills(
             dst = next_dst
 
     return True
+
+
+def set_triton_ptr_range(region: torch.Tensor, *views: torch.Tensor) -> None:
+    """Bound the bytes Triton kernels may access through ``views``.
+
+    Triton's AMD backend uses 32-bit buffer addressing only for pointer
+    arguments within 2 GiB. It checks ``ptr_range()`` first and otherwise the
+    size of the whole storage, so views into one large allocation (such as a
+    layer of the KV cache) lose it. Each view gets the distance from its
+    ``data_ptr()`` to the end of ``region``; kernels must not access past it.
+    """
+    if region.numel() == 0:
+        return
+    last = sum((n - 1) * stride for n, stride in zip(region.shape, region.stride()))
+    region_end = region.data_ptr() + (last + 1) * region.element_size()
+    for view in views:
+        view.ptr_range = functools.partial(int, region_end - view.data_ptr())
 
 
 def reshape_query_for_spec_decode(query: torch.Tensor, batch_size: int) -> torch.Tensor:
