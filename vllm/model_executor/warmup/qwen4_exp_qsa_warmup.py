@@ -19,7 +19,7 @@ logger = init_logger(__name__)
 def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
     """Warm every reachable QSA specialization: indexer decode-query-length
     profiles plus the sparse attention split-K/merge configs."""
-    qsa_module = sys.modules.get("vllm.models.qwen4_exp.nvidia.indexer_qsa")
+    qsa_module = sys.modules.get("vllm.models.qwen4_exp.nvidia.qsa_indexer")
     attn_module = sys.modules.get("vllm.models.qwen4_exp.nvidia.qsa")
     if qsa_module is None or attn_module is None:
         return
@@ -86,3 +86,12 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
         attention_profiles,
     )
+    if owner.hisparse_cache is not None:
+        hot_profiles = warmup_qsa_sparse_paged_attention(
+            owner.hisparse_kv_view(owner.hisparse_cache.runtime.hot.attention_cache),
+            block_table_for(owner.layer_name),
+            num_query_heads=owner.num_heads,
+            selection_width=indexer.output_width,
+            physical_indices=True,
+        )
+        logger.info("Warmed up Qwen4Exp QSA HiSparse decode kernels: %s.", hot_profiles)
