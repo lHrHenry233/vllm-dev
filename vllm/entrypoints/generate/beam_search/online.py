@@ -78,7 +78,7 @@ class BeamSearchOnlineMixin(ABC):
             self.engine_client.input_processor.generation_config_fields,
             tokenizer.eos_token_id,
         )
-        sort_beams_key = create_sort_beams_key_function(eos_token_ids, length_penalty)
+        sort_beams_key = create_sort_beams_key_function(length_penalty)
         all_beams = [
             BeamSearchSequence(
                 orig_prompt=prompt,
@@ -216,6 +216,12 @@ class BeamSearchOnlineMixin(ABC):
                     )
                 )
 
+            # Finished hypotheses never change score. Keep only the ones that
+            # could still be returned, preserving insertion order on ties.
+            if len(completed) > beam_width:
+                completed = sorted(completed, key=sort_beams_key, reverse=True)[
+                    :beam_width
+                ]
             all_beams = new_beams
             if not all_beams:
                 break
